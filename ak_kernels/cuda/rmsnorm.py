@@ -23,7 +23,7 @@ KERNEL_TYPE = "rmsnorm"
 BACKEND = "cuda"
 
 import torch
-from kernels.cuda._compile import compile_cuda
+from ak_kernels.cuda._compile import compile_cuda
 
 CUDA_SRC = r"""
 #include <torch/extension.h>

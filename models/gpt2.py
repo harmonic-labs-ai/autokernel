@@ -6,7 +6,7 @@ library. It implements the core architecture so AutoKernel can profile and
 optimize the bottleneck kernels.
 
 Usage:
-    uv run profile.py --model models/gpt2.py --class-name GPT2 --input-shape 1,1024 --dtype float16
+    uv run profile_model.py --model models/gpt2.py --class-name GPT2 --input-shape 1,1024 --dtype float16
 """
 
 import math

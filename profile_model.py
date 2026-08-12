@@ -3,9 +3,9 @@
 AutoKernel Model Profiler -- Profile any PyTorch model to identify bottleneck kernels.
 
 Usage:
-    uv run profile.py --model models/llama_7b.py --class-name LlamaModel --input-shape 1,2048 --dtype float16
-    uv run profile.py --model models/gpt2.py --class-name GPT2 --input-shape 1,1024
-    uv run profile.py --module transformers --class-name AutoModelForCausalLM --pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048
+    uv run profile_model.py --model models/llama_7b.py --class-name LlamaModel --input-shape 1,2048 --dtype float16
+    uv run profile_model.py --model models/gpt2.py --class-name GPT2 --input-shape 1,1024
+    uv run profile_model.py --module transformers --class-name AutoModelForCausalLM --pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048
 
 Output: profile_report.json in workspace/ directory
 """
@@ -54,13 +54,13 @@ _KERNEL_CLASSIFICATION: List[Tuple[List[str], str]] = [
     (["reduce", "all_reduce"],                 "reduce"),
 ]
 
-# Op types that have a matching kernels/*.py file in AutoKernel.
+# Op types that have a matching ak_kernels/*.py file in AutoKernel.
 _SUPPORTED_OP_TYPES: set[str] = set()
 
 
 def _discover_supported_op_types() -> set[str]:
-    """Scan kernels/ directory for supported kernel types."""
-    kernels_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+    """Scan ak_kernels/ directory for supported kernel types."""
+    kernels_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ak_kernels")
     supported = set()
     if os.path.isdir(kernels_dir):
         for fname in os.listdir(kernels_dir):
@@ -466,7 +466,7 @@ def classify_kernel(kernel_name: str) -> str:
 
 
 def is_autokernel_supported(op_type: str) -> bool:
-    """Check if this op type has a matching kernels/*.py implementation."""
+    """Check if this op type has a matching ak_kernels/*.py implementation."""
     return op_type in _SUPPORTED_OP_TYPES
 
 
@@ -832,12 +832,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  uv run profile.py --model models/llama_7b.py "
+            "  uv run profile_model.py --model models/llama_7b.py "
             "--class-name LlamaModel --input-shape 1,2048 --dtype float16\n"
-            "  uv run profile.py --module transformers "
+            "  uv run profile_model.py --module transformers "
             "--class-name AutoModelForCausalLM "
             "--pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048\n"
-            "  uv run profile.py --model my_net.py "
+            "  uv run profile_model.py --model my_net.py "
             "--class-name MyNet --input-shape 8,3,224,224 --dtype float32\n"
         ),
     )
@@ -943,7 +943,7 @@ def main() -> int:
     WARMUP_ITERS = args.warmup_iters
     PROFILE_ITERS = args.profile_iters
 
-    # Discover supported kernel types from kernels/ directory
+    # Discover supported kernel types from ak_kernels/ directory
     global _SUPPORTED_OP_TYPES
     _SUPPORTED_OP_TYPES = _discover_supported_op_types()
 

@@ -35,18 +35,20 @@ The human gives you one of:
 
 Record these details. You will use them throughout the run.
 
+Important note, for any Vision Language Model only optimize language backbone, not the vision tower.
+
 ### A2. Profile the model
 
 Run profiling to identify where the model spends its time:
 
 ```bash
-uv run profile.py --model <path> --class-name <name> --input-shape <shape>
+uv run profile_model.py --model <path> --class-name <name> --input-shape <shape>
 ```
 
 Or for HuggingFace models:
 
 ```bash
-uv run profile.py --module transformers --class-name AutoModelForCausalLM --pretrained <model_name> --input-shape <shape>
+uv run profile_model.py --module transformers --class-name AutoModelForCausalLM --pretrained <model_name> --input-shape <shape>
 ```
 
 Read the output. The profiler reports:
@@ -142,7 +144,7 @@ Read every file in the repo:
 - `reference.py` -- PyTorch reference implementations (do not modify)
 - `prepare.py` -- one-time setup (do not modify)
 - `kernel.py` -- the single file you modify for each kernel
-- `kernels/` -- starter kernels for each supported type
+- `ak_kernels/` -- starter kernels for each supported type
 - `verify.py` -- end-to-end verification (do not modify)
 - `workspace/` -- extracted kernels and state
 
@@ -782,7 +784,7 @@ workspace/
 Two backends are available: **Triton** (default) and **CUDA C++** (`--backend cuda`).
 
 ```
-kernels/                    Triton starters (Python + @triton.jit)
+ak_kernels/                 Triton starters (Python + @triton.jit)
   matmul.py                   -- tiled matrix multiplication
   softmax.py                  -- row-parallel online softmax
   layernorm.py                -- layer normalization
@@ -793,7 +795,7 @@ kernels/                    Triton starters (Python + @triton.jit)
   rotary_embedding.py         -- rotary position embeddings
   reduce.py                   -- parallel reduction (sum)
 
-kernels/cuda/               CUDA C++ starters (tensor core accelerated)
+ak_kernels/cuda/            CUDA C++ starters (tensor core accelerated)
   _compile.py                 -- shared compilation utility (load_inline + caching)
   matmul.py                   -- wmma tensor core GEMM, double-buffered shared memory
   softmax.py                  -- warp shuffle reduction, __expf fast math
@@ -882,7 +884,7 @@ These are hard rules. Violating any of them is a bug.
 2. **Never modify `reference.py`**. These are the correctness oracles.
 3. **Never modify `prepare.py`**. This handles one-time setup.
 4. **Never modify `verify.py`**. This is the end-to-end verification harness.
-5. **Never modify `profile.py`** or **`extract.py`**. These are the analysis tools.
+5. **Never modify `profile_model.py`** or **`extract.py`**. These are the analysis tools.
 6. **Never modify `orchestrate.py`**. This is the orchestration engine.
 7. **Never add dependencies**. You can only use what is already in `pyproject.toml`.
 8. **Never skip correctness**. Every experiment must pass correctness checks.
@@ -904,7 +906,7 @@ These are hard rules. Violating any of them is a bug.
 Human: Optimize LLaMA 7B. Model at models/llama_7b.py, class LlamaModel.
        Input shape 1,2048, float16. Budget: 8 hours.
 
-Agent: [runs profile.py, presents bottleneck summary]
+Agent: [runs profile_model.py, presents bottleneck summary]
        Top 3: matmul (62%), attention (18%), rmsnorm (9%)
        Plan: matmul ~4h, attention ~2.5h, rmsnorm ~1.5h
        Estimated max end-to-end speedup: 1.7-1.8x

@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_DIR = os.path.join(SCRIPT_DIR, "workspace")
-KERNELS_DIR = os.path.join(SCRIPT_DIR, "kernels")
+KERNELS_DIR = os.path.join(SCRIPT_DIR, "ak_kernels")
 DEFAULT_REPORT_PATH = os.path.join(WORKSPACE_DIR, "profile_report.json")
 OPTIMIZATION_PLAN_PATH = os.path.join(WORKSPACE_DIR, "optimization_plan.json")
 
@@ -293,8 +293,8 @@ def order_test_dtypes(op_type: str, model_dtype: str) -> List[str]:
 def read_starter_kernel(op_type: str, backend: str = "triton") -> Optional[str]:
     """Read the starter kernel file. Returns None if not found.
 
-    For backend='triton': reads from kernels/{op_type}.py
-    For backend='cuda':   reads from kernels/cuda/{op_type}.py
+    For backend='triton': reads from ak_kernels/{op_type}.py
+    For backend='cuda':   reads from ak_kernels/cuda/{op_type}.py
     """
     if backend == "cuda":
         path = os.path.join(KERNELS_DIR, "cuda", f"{op_type}.py")
@@ -434,7 +434,7 @@ def generate_kernel_file(
     lines.append("")
     lines.append(f"# {'=' * 70}")
     backend_label = "CUDA C++" if backend == "cuda" else "Triton"
-    backend_dir = f"kernels/cuda/{op_type}.py" if backend == "cuda" else f"kernels/{op_type}.py"
+    backend_dir = f"ak_kernels/cuda/{op_type}.py" if backend == "cuda" else f"ak_kernels/{op_type}.py"
     lines.append(f"# {backend_label} kernel code (from {backend_dir})")
     lines.append(f"# {'=' * 70}")
     lines.append("")
@@ -537,7 +537,7 @@ def extract_kernels(
     report = load_profile_report(report_path)
     if report is None:
         print(f"ERROR: Profile report not found at {report_path}")
-        print(f"       Run the profiler first: uv run profile.py")
+        print(f"       Run the profiler first: uv run profile_model.py")
         sys.exit(1)
 
     # -- Get model name --
@@ -596,7 +596,7 @@ def extract_kernels(
         # Read starter kernel
         starter_code = read_starter_kernel(op_type, backend=backend)
         if starter_code is None:
-            starter_dir = "kernels/cuda" if backend == "cuda" else "kernels"
+            starter_dir = "ak_kernels/cuda" if backend == "cuda" else "ak_kernels"
             print(f"  WARNING: No starter kernel found at {starter_dir}/{op_type}.py -- skipping.")
             skipped += 1
             continue
@@ -631,7 +631,7 @@ def extract_kernels(
         print(f"  [{position}/{total}] {op_type} (rank {rank}, {pct_total}%) "
               f"-> {output_relpath}")
         print(f"        Model shape: {shape_display}")
-        starter_dir = "kernels/cuda" if backend == "cuda" else "kernels"
+        starter_dir = "ak_kernels/cuda" if backend == "cuda" else "ak_kernels"
         print(f"        Based on: {starter_dir}/{op_type}.py")
         print()
 

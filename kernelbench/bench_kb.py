@@ -46,7 +46,7 @@ WORKSPACE_DIR = PROJECT_DIR / "workspace"
 KB_ACTIVE_DIR = WORKSPACE_DIR / "kb_active"
 KERNEL_PY = PROJECT_DIR / "kernel.py"
 
-# Ensure project root is on sys.path (for `from kernels.cuda._compile import ...`)
+# Ensure project root is on sys.path (for `from ak_kernels.cuda._compile import ...`)
 sys.path.insert(0, str(PROJECT_DIR))
 
 # ---------------------------------------------------------------------------

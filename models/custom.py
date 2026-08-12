@@ -2,7 +2,7 @@
 Template for custom models. Copy this file and adapt for your own architecture.
 
 Usage:
-    uv run profile.py --model models/custom.py --class-name MyModel --input-shape 8,3,224,224 --dtype float16
+    uv run profile_model.py --model models/custom.py --class-name MyModel --input-shape 8,3,224,224 --dtype float16
 """
 
 import torch

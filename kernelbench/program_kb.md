@@ -210,7 +210,7 @@ These are standalone ops: matmul, relu, conv2d, softmax, layernorm, etc.
 - **Reductions** (sum, mean, max, min): Warp shuffle + shared memory.
   Use `__shfl_down_sync` for intra-warp, `__shared__` for inter-warp.
 
-- **Matmul**: Use wmma tensor cores. See `kernels/cuda/matmul.py` for reference.
+- **Matmul**: Use wmma tensor cores. See `ak_kernels/cuda/matmul.py` for reference.
 
 - **Convolutions**: Use `torch.nn.functional.conv2d` with optimal memory format
   (`torch.channels_last`), or write a custom im2col + GEMM kernel.
@@ -256,7 +256,7 @@ Pre-trained medium-sized models.
 
 ### Using AutoKernel's _compile.py
 
-The `compile_cuda()` function from `kernels/cuda/_compile.py` provides:
+The `compile_cuda()` function from `ak_kernels/cuda/_compile.py` provides:
 - Hash-based caching (only recompiles when source changes)
 - Architecture auto-detection (generates correct -gencode flags)
 - Error diagnostics (prints CUDA source with line numbers on failure)

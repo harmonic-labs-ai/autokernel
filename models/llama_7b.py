@@ -7,10 +7,10 @@ Uses RMSNorm, RoPE, SwiGLU MLP, and grouped-query attention
 
 Usage:
     # LLaMA-160M (fast, for testing)
-    uv run profile.py --model models/llama_7b.py --class-name LlamaModel --input-shape 1,512 --dtype float16
+    uv run profile_model.py --model models/llama_7b.py --class-name LlamaModel --input-shape 1,512 --dtype float16
 
     # LLaMA-7B scale (needs ~14GB VRAM in fp16)
-    uv run profile.py --model models/llama_7b.py --class-name LlamaModel7B --input-shape 1,2048 --dtype float16
+    uv run profile_model.py --model models/llama_7b.py --class-name LlamaModel7B --input-shape 1,2048 --dtype float16
 """
 
 import math

@@ -4,7 +4,7 @@ Minimal BERT-base implementation for AutoKernel profiling.
 Self-contained -- no transformers library needed.
 
 Usage:
-    uv run profile.py --model models/bert_base.py --class-name BertModel --input-shape 8,512 --dtype float16
+    uv run profile_model.py --model models/bert_base.py --class-name BertModel --input-shape 8,512 --dtype float16
 """
 
 import math

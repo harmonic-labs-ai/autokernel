@@ -38,7 +38,7 @@ uv sync
 uv run prepare.py
 
 # Profile a model (ships with GPT-2, LLaMA, BERT -- no transformers needed)
-uv run profile.py --model models/llama_7b.py --class-name LlamaModel \
+uv run profile_model.py --model models/llama_7b.py --class-name LlamaModel \
  --input-shape 1,512 --dtype float16
 
 # Extract top bottleneck kernels
@@ -67,14 +67,14 @@ The agent will:
 ## The Pipeline
 
 ```
-                 profile.py              extract.py           bench.py (loop)         verify.py
+           profile_model.py              extract.py           bench.py (loop)         verify.py
 Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimize each  ──>  End-to-end
    model          by GPU time       Triton/CUDA kernels     kernel (agent)       verification
 ```
 
 | Tool | What it does |
 |------|-------------|
-| `profile.py` | Profiles any PyTorch model with `torch.profiler`, ranks kernels by GPU time, classifies as compute/memory-bound |
+| `profile_model.py` | Profiles any PyTorch model with `torch.profiler`, ranks kernels by GPU time, classifies as compute/memory-bound |
 | `extract.py` | Extracts top-N bottleneck kernels into standalone Triton or CUDA C++ kernel files (`--backend triton\|cuda`) |
 | `orchestrate.py` | Multi-kernel scheduler: decides which kernel to optimize next using Amdahl's law, tracks aggregate progress |
 | `bench.py` | Fixed benchmark: 5-stage correctness (smoke, shape sweep, numerical stability, determinism, edge cases) + performance + roofline |
@@ -96,7 +96,7 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | **rotary_embedding** | Rotary position embeddings (RoPE) | GB/s |
 | **reduce** | Parallel reduction (sum) | GB/s |
 
-Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/`.
+Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `ak_kernels/`, and a starter CUDA C++ kernel in `ak_kernels/cuda/`.
 
 ## Example Models
 
@@ -113,7 +113,7 @@ Self-contained model definitions ship with AutoKernel (no `transformers` library
 For HuggingFace models (`uv sync --extra models`):
 
 ```bash
-uv run profile.py --module transformers --class-name AutoModelForCausalLM \
+uv run profile_model.py --module transformers --class-name AutoModelForCausalLM \
  --pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048 --dtype float16
 ```
 
@@ -183,15 +183,15 @@ autokernel/
   reference.py          PyTorch reference implementations (ground truth)
   prepare.py            one-time setup: test data, baselines
 
-  profile.py            profile any PyTorch model, rank kernels by GPU time
+  profile_model.py      profile any PyTorch model, rank kernels by GPU time
   extract.py            extract bottleneck kernels into workspace/
   orchestrate.py        multi-kernel scheduler (Amdahl's law)
   verify.py             end-to-end model verification + speedup report
   export_hf.py          export optimized kernels to HuggingFace Kernels format
   analysis.py           experiment visualization (generates progress.png)
 
-  kernels/              starter Triton kernels (9 types)
-  kernels/cuda/         starter CUDA C++ kernels (9 types, tensor core accelerated)
+  ak_kernels/           starter Triton kernels (9 types)
+  ak_kernels/cuda/      starter CUDA C++ kernels (9 types, tensor core accelerated)
   kernelbench/          KernelBench integration (bridge, eval harness, scorer)
   models/               self-contained model definitions (GPT-2, LLaMA, BERT)
   workspace/            runtime artifacts (gitignored)
