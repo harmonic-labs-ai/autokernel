@@ -2,12 +2,21 @@
 
 ## Unreleased
 
+### Removed the KernelBench integration
+
+The `kernelbench/` package is gone: the problem loader (`bridge.py`), the
+`ModelNew` evaluation harness (`bench_kb.py`), the `fast_p` batch scorer
+(`scorer.py`), and the KernelBench agent playbook (`program_kb.md`), along with
+the `kernelbench` optional dependency (`datasets`). Nothing else in the repo
+imported it -- the core `kernel.py` / `bench.py` / `reference.py` loop and the
+profile -> extract -> orchestrate -> verify pipeline are unaffected.
+
 ### Removed the CUDA C++ backend
 
 Triton is now the only backend. The `ak_kernels/cuda/` starters, the
 `load_inline()` compilation utility, the `--backend cuda` flag, and the CUDA
 export path in `export_hf.py` are gone, along with the `cuda` optional
-dependency and the CUDA C++ playbooks in `program.md` / `kernelbench/program_kb.md`.
+dependency and the CUDA C++ playbook in `program.md`.
 
 The pipeline is still parameterized by backend rather than hardcoded to Triton:
 `extract.py` carries a `BACKENDS` registry and `export_hf.py` an `EXPORTERS`

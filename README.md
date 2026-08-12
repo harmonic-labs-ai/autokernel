@@ -117,42 +117,6 @@ uv run profile_model.py --module transformers --class-name AutoModelForCausalLM 
  --pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048 --dtype float16
 ```
 
-## KernelBench Integration
-
-AutoKernel integrates with [KernelBench](https://github.com/ScalingIntelligence/KernelBench),
-the standard benchmark for evaluating AI-generated GPU kernels (250+ problems across 4 difficulty
-levels). While most KernelBench evaluations use one-shot LLM generation, AutoKernel runs
-**50-300+ iterative refinement experiments per problem** -- systematically exploring the
-optimization space instead of guessing.
-
-```bash
-# Install KernelBench dependencies
-uv sync --extra kernelbench
-
-# Fetch Level 1 problems from HuggingFace
-uv run kernelbench/bridge.py fetch --source hf --level 1
-
-# Set up a specific problem for optimization
-uv run kernelbench/bridge.py setup --level 1 --problem 1 --source hf
-
-# Evaluate (correctness + speedup vs PyTorch reference)
-uv run kernelbench/bench_kb.py
-
-# Batch score an entire level (computes fast_p metric)
-uv run kernelbench/scorer.py --level 1
-```
-
-The agent reads `kernelbench/program_kb.md` for KernelBench-specific optimization instructions:
-how to write `ModelNew` classes, Triton fusion strategies per problem level, and the
-edit-bench-keep/revert loop adapted for the KernelBench `fast_p` metric.
-
-| Tool | What it does |
-|------|-------------|
-| `kernelbench/bridge.py` | Loads problems from HuggingFace or local repo, caches them, generates starter `kernel.py` |
-| `kernelbench/bench_kb.py` | Evaluates `ModelNew` vs `Model`: 5-trial correctness + CUDA event timing + stability + determinism |
-| `kernelbench/scorer.py` | Batch evaluation across a level, computes `fast_p` at thresholds (1.0x, 1.5x, 2.0x, 3.0x, 5.0x) |
-| `kernelbench/program_kb.md` | Agent instructions for KernelBench mode |
-
 ## HuggingFace Kernels Export
 
 Export optimized kernels to the [HuggingFace Hub](https://huggingface.co/docs/kernels/en/index)
@@ -191,7 +155,6 @@ autokernel/
   analysis.py           experiment visualization (generates progress.png)
 
   ak_kernels/           starter Triton kernels (9 types)
-  kernelbench/          KernelBench integration (bridge, eval harness, scorer)
   models/               self-contained model definitions (GPT-2, LLaMA, BERT)
   workspace/            runtime artifacts (gitignored)
 ```
@@ -229,8 +192,6 @@ Every experiment is logged to `results.tsv` (tab-separated):
 
 This project is **autoresearch for GPU kernels** -- directly inspired by Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), the original experiment in autonomous AI research agents for LLM training. Karpathy showed that an AI agent can run hundreds of experiments overnight, methodically exploring a search space and logging every result. AutoKernel applies that same loop -- agent edits one file, runs a fixed evaluation, keeps or reverts -- to the domain of GPU kernel optimization with Triton.
 
-**KernelBench** integration is based on the work of Simon Guo, Sean Resta, et al. at Stanford's Scaling Intelligence Lab. Their paper ["KernelBench: Can LLMs Write GPU Kernels?"](https://arxiv.org/abs/2502.10517) (2025) established the standard benchmark for evaluating AI-generated GPU kernels. AutoKernel extends this by applying iterative optimization (300+ experiments per problem) instead of one-shot generation. KernelBench dataset and evaluation protocol: [ScalingIntelligence/KernelBench](https://github.com/ScalingIntelligence/KernelBench).
-
 Built by [RightNow AI](https://www.rightnowai.co). For enterprise GPU optimization, check out [RightNow Enterprise](https://www.rightnowai.co/forge).
 
 ## Changelog
@@ -244,6 +205,7 @@ Built by [RightNow AI](https://www.rightnowai.co). For enterprise GPU optimizati
 - Fixed Triton reduce output shape for non-last-dim reductions
 
 ### Unreleased
+- Removed the KernelBench integration (bridge, eval harness, scorer, agent playbook)
 - Removed the CUDA C++ backend -- Triton only (the pipeline stays backend-parameterized)
 - Fixed 20+ correctness and measurement bugs across the harness and starter kernels
 
