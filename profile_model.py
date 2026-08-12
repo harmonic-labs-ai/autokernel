@@ -23,7 +23,7 @@ import pickle
 import re
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -509,6 +509,8 @@ class KernelRecord:
     gpu_time_us: float
     call_count: int
     input_shapes: str  # string representation of shapes
+    arg_shapes: List[List[int]] = field(default_factory=list)  # structured, per positional arg
+    is_aten: bool = False  # aten:: op (carries shapes) vs. raw CUDA kernel
     roofline: str = ""
     supported: bool = False
 
@@ -626,12 +628,19 @@ def profile_model(
         name = evt.key
         op_type = classify_kernel(name)
 
-        # Build shape info string
+        # Build shape info -- structured plus a string form for back-compat.
+        arg_shapes: List[List[int]] = []
         shape_str = ""
         if evt.input_shapes:
             try:
+                for entry in evt.input_shapes:
+                    if isinstance(entry, (list, tuple)):
+                        arg_shapes.append([int(d) for d in entry])
+                    else:
+                        arg_shapes.append([])
                 shape_str = str(evt.input_shapes)
             except Exception:
+                arg_shapes = []
                 shape_str = ""
 
         records.append(KernelRecord(
@@ -640,6 +649,11 @@ def profile_model(
             gpu_time_us=cuda_time_us,
             call_count=evt.count,
             input_shapes=shape_str,
+            arg_shapes=arg_shapes,
+            # ProfilerActivity.CPU contributes aten:: op rows; CUDA contributes
+            # the device kernels those ops launched. Both carry device time, so
+            # the two populations each account for the same physical work.
+            is_aten="::" in name,
         ))
 
     # Sort by GPU time descending
@@ -668,25 +682,43 @@ def build_report(
     model_desc: str,
 ) -> Dict[str, Any]:
     """Build the profile_report.json structure."""
-    total_gpu_time_us = sum(r.gpu_time_us for r in records)
+    # key_averages() reports the aten:: ops and the CUDA kernels they launched
+    # side by side, and both carry device time -- so summing everything counts
+    # the same physical work twice and halves every percentage. Attribute time
+    # against a single population: the aten ops, which are also the only rows
+    # that carry input shapes.
+    aten_records = [r for r in records if r.is_aten]
+    attribution = aten_records if aten_records else records
+
+    total_gpu_time_us = sum(r.gpu_time_us for r in attribution)
     total_gpu_time_ms = total_gpu_time_us / 1000.0
 
     # Annotate records with roofline + supported
     for r in records:
         r.roofline = estimate_roofline_position(r.name, r.op_type, r.gpu_time_us, gpu)
-        r.supported = is_autokernel_supported(r.op_type)
+        # Device-kernel rows duplicate work already attributed to an aten op,
+        # so they are reported for reference but not offered as targets.
+        r.supported = is_autokernel_supported(r.op_type) and (
+            r.is_aten or not aten_records
+        )
 
     # Build top_kernels list
     top_kernels = []
     cumulative_pct = 0.0
     for i, r in enumerate(records):
+        # Only rows in the attribution population contribute to the running
+        # cumulative total, so cumulative_pct still converges on 100%.
+        counts_toward_total = r.is_aten or not aten_records
         pct = (r.gpu_time_us / total_gpu_time_us * 100.0) if total_gpu_time_us > 0 else 0.0
-        cumulative_pct += pct
+        if counts_toward_total:
+            cumulative_pct += pct
         top_kernels.append({
             "rank": i + 1,
             "name": r.name,
             "op_type": r.op_type,
             "shape_info": r.input_shapes,
+            "input_shapes": r.arg_shapes,
+            "source": "aten_op" if r.is_aten else "device_kernel",
             "gpu_time_ms": round(r.gpu_time_us / 1000.0, 3),
             "call_count": r.call_count,
             "avg_time_us": round(r.gpu_time_us / max(r.call_count, 1), 2),
@@ -701,7 +733,7 @@ def build_report(
     supported_time_us = sum(r.gpu_time_us for r in records if r.supported)
     supported_pct = (supported_time_us / total_gpu_time_us * 100.0) if total_gpu_time_us > 0 else 0.0
 
-    top5_time_us = sum(r.gpu_time_us for r in records[:5])
+    top5_time_us = sum(r.gpu_time_us for r in attribution[:5])
     top5_pct = (top5_time_us / total_gpu_time_us * 100.0) if total_gpu_time_us > 0 else 0.0
 
     # Estimated max speedup via Amdahl's law:

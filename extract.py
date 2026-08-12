@@ -203,38 +203,160 @@ SPEEDUP_ESTIMATES: Dict[str, str] = {
 # Shape parsing
 # ---------------------------------------------------------------------------
 
-def parse_shape_info(shape_info_str: str, op_type: str) -> Optional[Dict[str, int]]:
-    """
-    Parse a shape_info string like "M=4096, N=4096, K=4096" into a dict.
+def _apply_alias_map(raw: Dict[str, int], op_type: str) -> Dict[str, int]:
+    """Map raw shape keys onto the canonical bench.py keys for this op_type."""
+    alias_map = SHAPE_ALIAS_MAP.get(op_type, {})
+    if not alias_map:
+        return raw
+    return {alias_map.get(k, k): v for k, v in raw.items()}
 
-    Handles various formats:
-      - "M=4096, N=4096, K=4096"
-      - "B=1, H=32, N=4096, D=128"
-      - "batch=4096, vocab=32000"
-      - "rows=4096, cols=4096"
+
+def _canonical_op_name(name: str) -> str:
+    """Reduce a profiler event name to a bare op name.
+
+    "aten::addmm" -> "addmm", "aten::max_pool2d.default" -> "max_pool2d".
+    Raw CUDA kernel names (e.g. "sm80_xmma_gemm_f16f16_...") pass through
+    lowercased, which is harmless -- they carry no input shapes anyway.
+    """
+    n = str(name).strip()
+    if "::" in n:
+        n = n.split("::", 1)[1]
+    if "." in n:
+        n = n.split(".", 1)[0]
+    return n.lower()
+
+
+def _prod(dims: List[int]) -> int:
+    total = 1
+    for d in dims:
+        total *= int(d)
+    return total
+
+
+def _gemm_shape_from_args(mats: List[List[int]]) -> Optional[Dict[str, int]]:
+    """Derive {M, N, K} from the positional tensor args of a GEMM-family op.
+
+    Covers aten::mm, addmm, bmm, baddbmm, matmul and linear uniformly by
+    taking the last two >=2-D operands (which skips addmm's 1-D bias and
+    linear's trailing bias) and reducing any leading/batch dims into M.
+
+    linear stores its weight transposed as [N, K] rather than [K, N], so the
+    contraction dim is matched against both axes to tell the two apart.
+    """
+    if len(mats) < 2:
+        return None
+
+    a, b = mats[-2], mats[-1]
+    K = int(a[-1])
+    M = _prod(a[:-1])
+
+    if int(b[-2]) == K:
+        N = int(b[-1])          # [K, N] -- mm / addmm / bmm / matmul
+    elif int(b[-1]) == K:
+        N = int(b[-2])          # [N, K] -- linear's transposed weight
+    else:
+        return None             # operands don't contract; not a GEMM we understand
+
+    if M <= 0 or N <= 0 or K <= 0:
+        return None
+    return {"M": M, "N": N, "K": K}
+
+
+def parse_shape_list(
+    arg_shapes: Any,
+    op_type: str,
+    name: str = "",
+) -> Optional[Dict[str, int]]:
+    """Derive a canonical shape dict from torch profiler positional input shapes.
+
+    torch.profiler records ``input_shapes`` as one entry per positional
+    argument, in argument order, with scalars represented as empty lists --
+    e.g. aten::addmm on a 4096x1536 @ 1536x1536 GEMM records
+    ``[[1536], [4096, 1536], [1536, 1536]]``.
+
+    Returns None if the shapes can't be interpreted for this op_type, so the
+    caller can fall back to defaults.
+    """
+    if not isinstance(arg_shapes, (list, tuple)) or not arg_shapes:
+        return None
+
+    # Keep only real tensor operands, in argument order.
+    mats: List[List[int]] = []
+    for entry in arg_shapes:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            try:
+                dims = [int(d) for d in entry]
+            except (TypeError, ValueError):
+                continue
+            if all(d > 0 for d in dims):
+                mats.append(dims)
+
+    if not mats:
+        return None
+
+    op = _canonical_op_name(name)
+
+    if op_type in ("matmul", "fused_mlp"):
+        gemm = _gemm_shape_from_args(mats)
+        return _apply_alias_map(gemm, op_type) if gemm else None
+
+    if op_type in ("flash_attention", "rotary_embedding"):
+        # Query is the first operand: [B, H, S, D] (or [B, S, H, D] for some
+        # rotary variants -- indistinguishable from shapes alone, so we take
+        # the common [B, H, S, D] layout).
+        q = mats[0]
+        if len(q) != 4:
+            return None
+        return _apply_alias_map(
+            {"B": q[0], "H": q[1], "N": q[2], "D": q[3]}, op_type
+        )
+
+    if op_type in ("layernorm", "rmsnorm", "softmax", "reduce", "cross_entropy"):
+        # Row-wise ops: everything but the last dim collapses into the row count.
+        x = mats[0]
+        return _apply_alias_map({"M": _prod(x[:-1]), "N": int(x[-1])}, op_type)
+
+    return None
+
+
+def parse_shape_info(
+    shape_info: Any,
+    op_type: str,
+    name: str = "",
+) -> Optional[Dict[str, int]]:
+    """
+    Parse the ``shape_info`` field of a profile report entry into a shape dict.
+
+    Handles the formats a report may carry:
+      - a real list of positional arg shapes: [[4096, 1536], [1536, 1536]]
+      - its string form, as written by str(evt.input_shapes)
+      - hand-written key=value strings: "M=4096, N=4096, K=4096"
 
     Returns None if parsing fails.
     """
-    if not shape_info_str or not isinstance(shape_info_str, str):
+    # Structured list straight from the profiler.
+    if isinstance(shape_info, (list, tuple)):
+        return parse_shape_list(shape_info, op_type, name)
+
+    if not shape_info or not isinstance(shape_info, str):
         return None
 
-    # Match key=value pairs
-    pairs = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\d+)", shape_info_str)
-    if not pairs:
-        return None
+    # key=value form takes precedence -- it is already canonical.
+    pairs = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\d+)", shape_info)
+    if pairs:
+        return _apply_alias_map({k: int(v) for k, v in pairs}, op_type)
 
-    raw = {k: int(v) for k, v in pairs}
+    # Bracketed nested-list form, i.e. str() of the profiler's input_shapes.
+    if "[" in shape_info:
+        groups = re.findall(r"\[([0-9,\s]*)\]", shape_info)
+        if groups:
+            arg_shapes = [
+                [int(tok) for tok in g.replace(" ", "").split(",") if tok]
+                for g in groups
+            ]
+            return parse_shape_list(arg_shapes, op_type, name)
 
-    # Map to canonical bench.py keys using alias map
-    alias_map = SHAPE_ALIAS_MAP.get(op_type, {})
-    if alias_map:
-        canonical = {}
-        for k, v in raw.items():
-            mapped_key = alias_map.get(k, k)
-            canonical[mapped_key] = v
-        return canonical
-    else:
-        return raw
+    return None
 
 
 def shape_to_display(shape: Dict[str, int]) -> str:
@@ -267,6 +389,99 @@ def get_default_shape(op_type: str) -> Dict[str, int]:
         "rotary_embedding": {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128},
     }
     return defaults.get(op_type, {"M": 2048, "N": 2048})
+
+
+def resolve_model_shape(kernel_info: Dict[str, Any]) -> Tuple[Dict[str, int], str]:
+    """Resolve one report entry to (shape, source).
+
+    source is one of:
+      "profiled" -- derived from shapes the profiler actually recorded
+      "report"   -- taken from an explicit "shapes" dict in the report
+      "default"  -- nothing usable in the report; generic fallback shape
+    """
+    op_type = kernel_info.get("op_type", "unknown")
+    name = kernel_info.get("name", "")
+
+    # Prefer the structured field; fall back to the stringified one.
+    raw_shapes = kernel_info.get("input_shapes")
+    if raw_shapes is None:
+        raw_shapes = kernel_info.get("shape_info", kernel_info.get("shape", ""))
+
+    shape = parse_shape_info(raw_shapes, op_type, name)
+    if shape:
+        return shape, "profiled"
+
+    if isinstance(kernel_info.get("shapes"), dict) and kernel_info["shapes"]:
+        return kernel_info["shapes"], "report"
+
+    return get_default_shape(op_type), "default"
+
+
+def _shape_key(op_type: str, shape: Dict[str, int]) -> Tuple:
+    return (op_type, tuple(sorted((str(k), int(v)) for k, v in shape.items())))
+
+
+def dedupe_kernels(
+    resolved: List[Dict[str, Any]],
+    time_tol: float = 0.02,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Collapse report entries that describe the same physical kernel.
+
+    Two things produce duplicates in a profile_report.json:
+
+      1. The same op at the same shape appearing under more than one name.
+      2. An ``aten::*`` op and the raw CUDA kernel it launched both being
+         reported, since key_averages() covers CPU and CUDA activities alike.
+         These have near-identical device time, but only the aten row carries
+         input shapes -- so the kernel row lands on a default shape and looks
+         like a distinct target.
+
+    Case 1 is matched on (op_type, shape). Case 2 is matched on op_type plus
+    device time, and only ever folds a default-shaped entry into a profiled
+    one -- never the reverse, so a genuinely unparsed kernel is not silently
+    absorbed by an unrelated neighbour.
+
+    Merged entries accumulate pct_total so the plan's priority ordering still
+    reflects the real share of GPU time. Returns (kept, dropped).
+    """
+    kept: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+
+    for entry in resolved:
+        target = None
+
+        for existing in kept:
+            if existing["op_type"] != entry["op_type"]:
+                continue
+
+            if _shape_key(existing["op_type"], existing["model_shape"]) == \
+                    _shape_key(entry["op_type"], entry["model_shape"]):
+                target = existing
+                break
+
+            # aten op vs. its own CUDA kernel: same device time, but the
+            # kernel row never had shapes to parse.
+            if entry["shape_source"] == "default" and existing["shape_source"] == "profiled":
+                a, b = entry["gpu_time_ms"], existing["gpu_time_ms"]
+                if a > 0 and b > 0 and abs(a - b) <= time_tol * max(a, b):
+                    target = existing
+                    break
+
+        if target is None:
+            kept.append(entry)
+            continue
+
+        # Fold into the entry we are keeping. Device time is NOT summed: the
+        # duplicate is the same work seen twice, not additional work.
+        target["pct_total"] = round(target["pct_total"] + entry["pct_total"], 1)
+        target.setdefault("merged_from", []).append({
+            "rank": entry["rank"],
+            "name": entry.get("name", ""),
+            "gpu_time_ms": entry["gpu_time_ms"],
+        })
+        dropped.append(entry)
+
+    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +559,7 @@ def generate_kernel_file(
     starter_code: str,
     backend: str = "triton",
     model_dtype: str = "float16",
+    shape_source: str = "profiled",
 ) -> str:
     """Generate the complete kernel file content for extraction."""
 
@@ -380,6 +596,12 @@ def generate_kernel_file(
     lines.append(f"Rank: {rank} ({pct_total}% of GPU time)")
     lines.append(f"Model shape: {shape_display}")
     lines.append(f"Model dtype: {model_dtype}")
+    if shape_source != "profiled":
+        lines.append(f"")
+        lines.append(f"WARNING: shape source is '{shape_source}', not measured. The profile")
+        lines.append(f"report carried no usable shapes for this op, so the sizes above are a")
+        lines.append(f"generic fallback. Tuning against them optimizes a problem size the")
+        lines.append(f"model may never run -- re-profile with record_shapes=True first.")
     lines.append(f"")
     lines.append(f"This kernel was extracted from profiling {model_name}.")
     lines.append(f"The agent optimizes this to maximize throughput at the model-specific shapes.")
@@ -501,6 +723,9 @@ def generate_optimization_plan(
             "file": entry["output_file"],
             "op_type": entry["op_type"],
             "model_shape": entry["model_shape"],
+            # Downstream phases must not treat a fallback shape as measured.
+            "shape_source": entry.get("shape_source", "profiled"),
+            "merged_from": entry.get("merged_from", []),
             "gpu_time_ms": entry["gpu_time_ms"],
             "pct_total": entry["pct_total"],
             "estimated_speedup_potential": SPEEDUP_ESTIMATES.get(
@@ -508,10 +733,13 @@ def generate_optimization_plan(
             ),
         })
 
+    defaulted = [k for k in kernels_to_optimize if k["shape_source"] == "default"]
+
     return {
         "kernels_to_optimize": kernels_to_optimize,
         "total_optimization_targets": len(kernels_to_optimize),
         "covered_gpu_time_pct": round(total_pct, 1),
+        "kernels_with_default_shapes": len(defaulted),
     }
 
 
@@ -561,37 +789,71 @@ def extract_kernels(
             print(f"WARNING: No kernels of type '{kernel_type_filter}' found in profile report.")
             sys.exit(1)
 
-    if top_n is not None:
-        supported = supported[:top_n]
+    # NOTE: --top is applied after dedup, further down, so that N asks for N
+    # distinct kernels rather than N report rows that may collapse into fewer.
 
-    print(f"Found {len(supported)} supported kernels to extract.")
+    print(f"Found {len(supported)} supported kernels in the report.")
     print()
 
     # -- Ensure workspace directory exists --
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
+    # -- Resolve shapes up front, so duplicates can be collapsed before we
+    #    write any files (two entries for one kernel would otherwise become
+    #    two identical optimization targets).
+    resolved = []
+    for idx, kernel_info in enumerate(supported):
+        model_shape, shape_source = resolve_model_shape(kernel_info)
+        resolved.append({
+            "rank": kernel_info.get("rank", idx + 1),
+            "name": kernel_info.get("name", ""),
+            "op_type": kernel_info.get("op_type", "unknown"),
+            "pct_total": kernel_info.get("pct_total", kernel_info.get("pct_gpu_time", 0.0)),
+            "gpu_time_ms": kernel_info.get(
+                "gpu_time_ms", kernel_info.get("total_gpu_time_ms", 0.0)
+            ),
+            "model_shape": model_shape,
+            "shape_source": shape_source,
+        })
+
+    resolved, duplicates = dedupe_kernels(resolved)
+
+    for dup in duplicates:
+        print(f"  NOTE: rank {dup['rank']} ({dup['op_type']}) duplicates an earlier "
+              f"entry at the same shape -- merged, not extracted twice.")
+    if duplicates:
+        print()
+
+    # Now that duplicates are gone, --top N means N distinct kernels.
+    if top_n is not None:
+        resolved = resolved[:top_n]
+
+    print(f"Extracting {len(resolved)} distinct kernel(s).")
+    print()
+
+    defaulted = [e for e in resolved if e["shape_source"] == "default"]
+    if defaulted:
+        print(f"  WARNING: {len(defaulted)} kernel(s) had no parseable shape in the "
+              f"report and fall back to generic defaults:")
+        for e in defaulted:
+            print(f"           rank {e['rank']} ({e['op_type']}) -> "
+                  f"{shape_to_display(e['model_shape'])}")
+        print(f"           These will be tuned at the wrong problem size. Check that "
+              f"the profiler ran with record_shapes=True.")
+        print()
 
     # -- Extract each kernel --
     print("Extracting kernels:")
     extracted = []
     skipped = 0
 
-    for idx, kernel_info in enumerate(supported):
-        rank = kernel_info.get("rank", idx + 1)
-        op_type = kernel_info.get("op_type", "unknown")
-        pct_total = kernel_info.get("pct_total", kernel_info.get("pct_gpu_time", 0.0))
-        gpu_time_ms = kernel_info.get("gpu_time_ms", kernel_info.get("total_gpu_time_ms", 0.0))
-        shape_info_str = kernel_info.get("shape_info", kernel_info.get("shape", ""))
-
-        # Parse model shape
-        model_shape = parse_shape_info(shape_info_str, op_type)
-        if model_shape is None:
-            # Try to use a "shapes" dict directly if provided
-            if isinstance(kernel_info.get("shapes"), dict):
-                model_shape = kernel_info["shapes"]
-            else:
-                print(f"  WARNING: Could not parse shape for {op_type} (rank {rank}), "
-                      f"using default shapes.")
-                model_shape = get_default_shape(op_type)
+    for idx, entry in enumerate(resolved):
+        rank = entry["rank"]
+        op_type = entry["op_type"]
+        pct_total = entry["pct_total"]
+        gpu_time_ms = entry["gpu_time_ms"]
+        model_shape = entry["model_shape"]
+        shape_source = entry["shape_source"]
 
         # Read starter kernel
         starter_code = read_starter_kernel(op_type, backend=backend)
@@ -618,6 +880,7 @@ def extract_kernels(
             starter_code=starter_code,
             backend=backend,
             model_dtype=model_dtype,
+            shape_source=shape_source,
         )
 
         # Write to workspace
@@ -626,11 +889,12 @@ def extract_kernels(
 
         # Print progress
         position = idx + 1
-        total = len(supported)
+        total = len(resolved)
         shape_display = shape_to_display(model_shape)
+        shape_note = "" if shape_source == "profiled" else f"  [{shape_source} shape]"
         print(f"  [{position}/{total}] {op_type} (rank {rank}, {pct_total}%) "
               f"-> {output_relpath}")
-        print(f"        Model shape: {shape_display}")
+        print(f"        Model shape: {shape_display}{shape_note}")
         starter_dir = "ak_kernels/cuda" if backend == "cuda" else "ak_kernels"
         print(f"        Based on: {starter_dir}/{op_type}.py")
         print()
@@ -641,6 +905,8 @@ def extract_kernels(
             "pct_total": pct_total,
             "gpu_time_ms": gpu_time_ms,
             "model_shape": model_shape,
+            "shape_source": shape_source,
+            "merged_from": entry.get("merged_from", []),
             "output_file": output_relpath,
         })
 
