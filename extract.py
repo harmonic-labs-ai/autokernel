@@ -203,6 +203,20 @@ SPEEDUP_ESTIMATES: Dict[str, str] = {
 # Shape parsing
 # ---------------------------------------------------------------------------
 
+# Attention entry points whose q/k/v are laid out [B, S, H, D] rather than the
+# [B, H, S, D] that scaled_dot_product_attention and its backends use.
+_ATTENTION_BSHD_OPS = {
+    "_flash_attention_forward",
+    "flash_attn_func",
+    "flash_attn_varlen_func",
+    "_flash_attention_backward",
+}
+
+# No production attention config has more heads than this; used to detect a
+# misread [B, S, H, D] / [B, H, S, D] axis order.
+_MAX_PLAUSIBLE_HEADS = 256
+
+
 def _apply_alias_map(raw: Dict[str, int], op_type: str) -> Dict[str, int]:
     """Map raw shape keys onto the canonical bench.py keys for this op_type."""
     alias_map = SHAPE_ALIAS_MAP.get(op_type, {})
@@ -301,15 +315,22 @@ def parse_shape_list(
         return _apply_alias_map(gemm, op_type) if gemm else None
 
     if op_type in ("flash_attention", "rotary_embedding"):
-        # Query is the first operand: [B, H, S, D] (or [B, S, H, D] for some
-        # rotary variants -- indistinguishable from shapes alone, so we take
-        # the common [B, H, S, D] layout).
+        # Query is the first operand, but the axis order depends on the op:
+        # the FlashAttention entry points take [B, S, H, D], while SDPA and
+        # its fused backends take [B, H, S, D].
         q = mats[0]
         if len(q) != 4:
             return None
-        return _apply_alias_map(
-            {"B": q[0], "H": q[1], "N": q[2], "D": q[3]}, op_type
-        )
+        if op in _ATTENTION_BSHD_OPS:
+            B, S, H, D = q
+        else:
+            B, H, S, D = q
+        # Guard the layout call: head counts are small and bounded, sequence
+        # lengths are not, so an implausible head count means we guessed the
+        # order wrong (e.g. reading [1, 2048, 28, 128] as 2048 heads of 28).
+        if H > _MAX_PLAUSIBLE_HEADS and H > S:
+            H, S = S, H
+        return _apply_alias_map({"B": B, "H": H, "N": S, "D": D}, op_type)
 
     if op_type in ("layernorm", "rmsnorm", "softmax", "reduce", "cross_entropy"):
         # Row-wise ops: everything but the last dim collapses into the row count.
@@ -415,6 +436,45 @@ def resolve_model_shape(kernel_info: Dict[str, Any]) -> Tuple[Dict[str, int], st
         return kernel_info["shapes"], "report"
 
     return get_default_shape(op_type), "default"
+
+
+def infer_missing_fused_mlp_shapes(resolved: List[Dict[str, Any]]) -> int:
+    """Recover fused_mlp shapes from the MLP's own projection pair, in place.
+
+    The profiler classifies a bare activation (aten::silu) as fused_mlp, but
+    its single operand [.., hidden] can't supply the (batch, dim, hidden)
+    triple the fused kernel is benchmarked on. The two projections that
+    bracket that activation are normally in the same report though --
+    gate/up as (K=dim, N=hidden) and down as (K=hidden, N=dim) at the same M
+    -- so the triple can be read off them instead of falling back to a
+    generic default.
+
+    Returns the number of entries filled in.
+    """
+    targets = [e for e in resolved
+               if e["op_type"] == "fused_mlp" and e["shape_source"] != "profiled"]
+    if not targets:
+        return 0
+
+    gemms = [e["model_shape"] for e in resolved
+             if e["op_type"] == "matmul" and e["shape_source"] == "profiled"
+             and {"M", "N", "K"} <= set(e["model_shape"])]
+
+    best = None
+    for a in gemms:
+        for b in gemms:
+            # a is gate/up (dim -> hidden), b is down (hidden -> dim).
+            if a["K"] == b["N"] and a["N"] == b["K"] and a["M"] == b["M"]:
+                cand = {"batch": a["M"], "dim": a["K"], "hidden": a["N"]}
+                if best is None or cand["hidden"] > best["hidden"]:
+                    best = cand
+    if best is None:
+        return 0
+
+    for e in targets:
+        e["model_shape"] = dict(best)
+        e["shape_source"] = "inferred"
+    return len(targets)
 
 
 def _shape_key(op_type: str, shape: Dict[str, int]) -> Tuple:
@@ -596,7 +656,11 @@ def generate_kernel_file(
     lines.append(f"Rank: {rank} ({pct_total}% of GPU time)")
     lines.append(f"Model shape: {shape_display}")
     lines.append(f"Model dtype: {model_dtype}")
-    if shape_source != "profiled":
+    if shape_source == "inferred":
+        lines.append(f"")
+        lines.append(f"NOTE: these sizes were not measured for this op directly -- they were")
+        lines.append(f"derived from the surrounding projection GEMMs in the profile report.")
+    elif shape_source != "profiled":
         lines.append(f"")
         lines.append(f"WARNING: shape source is '{shape_source}', not measured. The profile")
         lines.append(f"report carried no usable shapes for this op, so the sizes above are a")
@@ -815,6 +879,12 @@ def extract_kernels(
             "model_shape": model_shape,
             "shape_source": shape_source,
         })
+
+    n_inferred = infer_missing_fused_mlp_shapes(resolved)
+    if n_inferred:
+        print(f"  NOTE: recovered {n_inferred} fused_mlp shape(s) from the MLP "
+              f"projection GEMMs rather than falling back to defaults.")
+        print()
 
     resolved, duplicates = dedupe_kernels(resolved)
 
