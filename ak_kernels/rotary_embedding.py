@@ -102,15 +102,31 @@ def kernel_fn(
     x_flat = x.contiguous().view(-1, head_dim)
     n_rows = x_flat.shape[0]
 
-    # Flatten cos/sin and broadcast to match x rows
+    # Flatten cos/sin and broadcast to match x rows.
+    #
+    # Tiling only lines up when the dimensions cos/sin span are the trailing
+    # ones before head_dim -- the [..., seq_len, head_dim] layout. Under that
+    # layout, x row r and cos row r % n_cos refer to the same position. Assert
+    # it rather than silently rotating by the wrong angles.
     cos_flat = cos.contiguous().view(-1, half_dim)
     sin_flat = sin.contiguous().view(-1, half_dim)
+    assert cos_flat.shape == sin_flat.shape, "cos and sin must have the same shape"
 
-    # Handle broadcasting: if cos/sin have fewer rows, expand to match
-    if cos_flat.shape[0] < n_rows:
-        repeat_factor = (n_rows + cos_flat.shape[0] - 1) // cos_flat.shape[0]
-        cos_flat = cos_flat.repeat(repeat_factor, 1)[:n_rows]
-        sin_flat = sin_flat.repeat(repeat_factor, 1)[:n_rows]
+    n_cos = cos_flat.shape[0]
+    if n_cos < n_rows:
+        assert n_rows % n_cos == 0, (
+            f"cannot broadcast cos/sin with {n_cos} rows onto {n_rows} rows of x"
+        )
+        assert tuple(cos.shape[:-1]) == tuple(orig_shape[-1 - (cos.ndim - 1):-1]), (
+            "cos/sin must align with the trailing dimensions of x before head_dim "
+            f"(x shape {tuple(orig_shape)}, cos shape {tuple(cos.shape)})"
+        )
+        cos_flat = cos_flat.repeat(n_rows // n_cos, 1)
+        sin_flat = sin_flat.repeat(n_rows // n_cos, 1)
+    else:
+        assert n_cos == n_rows, (
+            f"cos/sin have {n_cos} rows but x has {n_rows}"
+        )
 
     out = torch.empty_like(x_flat)
 

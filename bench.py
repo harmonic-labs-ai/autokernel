@@ -47,45 +47,27 @@ class BenchTimeoutError(Exception):
 
 
 class _Timeout:
-    """Context-manager wall-clock timeout. Works on both Unix (SIGALRM) and
-    Windows (thread-based fallback)."""
+    """Context-manager wall-clock timeout (SIGALRM).
+
+    Only guards the CPU side of a launch: CUDA kernels are asynchronous, so a
+    hung GPU kernel is caught at the next synchronizing call, not here.
+    """
 
     def __init__(self, seconds: int):
         self.seconds = seconds
-        self._use_signal = hasattr(signal, "SIGALRM")
 
-    # --- signal-based (Unix) -------------------------------------------
     def _handler(self, signum, frame):
         raise BenchTimeoutError(f"Timed out after {self.seconds}s")
 
     def __enter__(self):
-        if self._use_signal:
-            self._old = signal.signal(signal.SIGALRM, self._handler)
-            signal.alarm(self.seconds)
-        else:
-            import threading
-            self._timer = threading.Timer(self.seconds, self._timeout_thread)
-            self._timer.daemon = True
-            self._timed_out = False
-            self._timer.start()
+        self._old = signal.signal(signal.SIGALRM, self._handler)
+        signal.alarm(self.seconds)
         return self
 
     def __exit__(self, *exc):
-        if self._use_signal:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, self._old)
-        else:
-            self._timer.cancel()
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, self._old)
         return False
-
-    def _timeout_thread(self):
-        self._timed_out = True
-        # On Windows we cannot forcefully interrupt the main thread the same
-        # way SIGALRM does.  We set a flag; callers that iterate can check it.
-        # For truly blocking GPU calls, this will not help -- but at least
-        # the outer try/except will catch it after the call returns.
-        import _thread
-        _thread.interrupt_main()
 
 
 # =========================================================================
@@ -114,17 +96,17 @@ _KNOWN_GPUS: Dict[str, Tuple[float, float, float]] = {
     "A100-PCIE":  (312.0,  1935.0, 40.0),
     "A100":       (312.0,  2039.0, 40.0),   # fallback
     "L40S":       (362.05, 864.0,  48.0),
-    "L4":         (121.0,  300.0,  48.0),
-    "A10":        (125.0,  600.0,  6.0),
-    "4090":       (330.0,  1008.0, 72.0),
-    "4080":       (305.0,  716.8,  64.0),
-    "3090":       (142.0,  936.2,  6.0),
-    "3080":       (119.5,  760.3,  5.0),
+    "L4":         (60.5,   300.0,  48.0),
+    "A10":        (62.5,   600.0,  6.0),
+    "4090":       (165.2,  1008.0, 72.0),
+    "4080":       (152.5,  716.8,  64.0),
+    "3090":       (71.0,   936.2,  6.0),
+    "3080":       (59.5,   760.3,  5.0),
     # AMD Instinct GPUs
     "MI300X":     (1307.4, 5300.0, 256.0),
     "MI325X":     (1307.4, 6000.0, 256.0),
     "MI350X":     (2300.0, 8000.0, 256.0),
-    "MI355X":     (2300.0, 8000.0, 256.0),
+    "MI355X":     (2300.0, 8000.0, 256.0),  # dense FP16 matrix-core
 }
 
 # AMD GPU database keyed by gcnArchName prefix for ROCm detection.
@@ -184,8 +166,9 @@ def detect_gpu() -> GPUSpec:
             peak_bw = 2000.0   # conservative estimate
         l2 = props.L2_cache_size / (1024 * 1024) if hasattr(props, 'L2_cache_size') else 0.0
 
-    # Derive bf16 and fp32 from fp16
-    # For Ampere/Hopper: bf16 ~ fp16, fp32 ~ fp16/2
+    # Derive bf16 and fp32 from fp16.
+    # Ampere/Hopper run bf16 at the fp16 tensor-core rate; fp32 matmul goes
+    # through TF32 tensor cores at half that rate.
     peak_bf16 = peak_fp16
     peak_fp32 = peak_fp16 / 2.0
 
@@ -327,6 +310,20 @@ def _ref_reduce(inputs: dict) -> torch.Tensor:
 # =========================================================================
 # 4. KERNEL CONFIGS
 # =========================================================================
+
+def peak_tflops_for(gpu: GPUSpec, dtype: torch.dtype) -> float:
+    """Peak compute for the dtype actually being benchmarked.
+
+    Using the fp16 peak for every dtype understates an fp32 kernel's share of
+    the roofline and drags the ridge point with it, which flips the
+    compute/memory-bound verdict the optimization playbook keys off.
+    """
+    if dtype == torch.float32:
+        return gpu.peak_tflops_fp32
+    if dtype == torch.bfloat16:
+        return gpu.peak_tflops_bf16
+    return gpu.peak_tflops_fp16
+
 
 def _dtype_bytes(dtype: torch.dtype) -> int:
     """Return byte-width for a dtype."""
@@ -767,6 +764,17 @@ def _compare(output: torch.Tensor, expected: torch.Tensor, atol: float, rtol: fl
         return {
             "match": False,
             "reason": f"shape mismatch: {output.shape} vs {expected.shape}",
+            "max_abs_error": float("inf"),
+            "mean_abs_error": float("inf"),
+            "pct_within_tol": 0.0,
+        }
+
+    # A kernel that widens its output is not a drop-in replacement, and
+    # comparing in fp32 would hide it.
+    if output.dtype != expected.dtype:
+        return {
+            "match": False,
+            "reason": f"dtype mismatch: {output.dtype} vs {expected.dtype}",
             "max_abs_error": float("inf"),
             "mean_abs_error": float("inf"),
             "pct_within_tol": 0.0,
@@ -1236,32 +1244,42 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
 # 6. PERFORMANCE BENCHMARKING
 # =========================================================================
 
-def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
-    """Benchmark a function and return median time in milliseconds.
-    Uses triton.testing.do_bench if available, otherwise manual implementation."""
+def _do_bench(fn: Callable, warmup_ms: int = 25, rep_ms: int = 100) -> float:
+    """Benchmark a function and return the median time in milliseconds.
+
+    warmup_ms/rep_ms are wall-clock budgets, matching triton.testing.do_bench's
+    units. do_bench defaults to the mean, so the median is requested explicitly
+    to keep both paths reporting the same statistic.
+    """
     try:
         from triton.testing import do_bench
-        ms = do_bench(fn, warmup=warmup, rep=rep)
-        return ms
     except ImportError:
-        pass
+        do_bench = None
 
-    # Fallback: manual benchmark
-    # Warmup
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
+    if do_bench is not None:
+        try:
+            return do_bench(fn, warmup=warmup_ms, rep=rep_ms, return_mode="median")
+        except TypeError:
+            # Older triton without return_mode: it returns the median already.
+            return do_bench(fn, warmup=warmup_ms, rep=rep_ms)
 
-    times = []
-    for _ in range(rep):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
+    # Fallback: run for the same wall-clock budgets, timed with CUDA events.
+    def _run_for(budget_ms: float) -> List[float]:
+        times: List[float] = []
+        deadline = time.perf_counter() + budget_ms / 1000.0
+        while True:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            times.append(start.elapsed_time(end))
+            if time.perf_counter() >= deadline:
+                return times
 
+    _run_for(warmup_ms)          # warmup, results discarded
+    times = _run_for(rep_ms)
     times.sort()
     return times[len(times) // 2]  # median
 
@@ -1308,11 +1326,11 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
 
             # Benchmark kernel
             with _Timeout(30):
-                kernel_ms = _do_bench(lambda: kernel_fn(**inputs), warmup=25, rep=100)
+                kernel_ms = _do_bench(lambda: kernel_fn(**inputs))
 
             # Benchmark PyTorch reference
             with _Timeout(30):
-                ref_ms = _do_bench(lambda: ref_fn(inputs), warmup=25, rep=100)
+                ref_ms = _do_bench(lambda: ref_fn(inputs))
 
             # Compute metrics
             kernel_us = kernel_ms * 1000.0
@@ -1321,18 +1339,14 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
             bandwidth_gb_s = nbytes / (kernel_ms / 1000.0) / 1e9 if kernel_ms > 0 else 0.0
             ref_throughput_tflops = flops / (ref_ms / 1000.0) / 1e12 if ref_ms > 0 else 0.0
 
-            # Roofline analysis
+            # Roofline analysis, against the peak for the dtype under test
+            peak_tflops = peak_tflops_for(gpu, dtype)
             arithmetic_intensity = flops / nbytes if nbytes > 0 else 0.0
-            ridge_point = (gpu.peak_tflops_fp16 * 1e12) / (gpu.peak_bandwidth_gb_s * 1e9) if gpu.peak_bandwidth_gb_s > 0 else 0.0
+            ridge_point = (peak_tflops * 1e12) / (gpu.peak_bandwidth_gb_s * 1e9) if gpu.peak_bandwidth_gb_s > 0 else 0.0
 
-            if arithmetic_intensity < ridge_point:
-                bottleneck = "memory_bound"
-                pct_peak_bandwidth = (bandwidth_gb_s / gpu.peak_bandwidth_gb_s * 100.0) if gpu.peak_bandwidth_gb_s > 0 else 0.0
-                pct_peak_compute = (throughput_tflops / gpu.peak_tflops_fp16 * 100.0) if gpu.peak_tflops_fp16 > 0 else 0.0
-            else:
-                bottleneck = "compute_bound"
-                pct_peak_compute = (throughput_tflops / gpu.peak_tflops_fp16 * 100.0) if gpu.peak_tflops_fp16 > 0 else 0.0
-                pct_peak_bandwidth = (bandwidth_gb_s / gpu.peak_bandwidth_gb_s * 100.0) if gpu.peak_bandwidth_gb_s > 0 else 0.0
+            pct_peak_compute = (throughput_tflops / peak_tflops * 100.0) if peak_tflops > 0 else 0.0
+            pct_peak_bandwidth = (bandwidth_gb_s / gpu.peak_bandwidth_gb_s * 100.0) if gpu.peak_bandwidth_gb_s > 0 else 0.0
+            bottleneck = "memory_bound" if arithmetic_intensity < ridge_point else "compute_bound"
 
             speedup = ref_ms / kernel_ms if kernel_ms > 0 else 0.0
 
@@ -1351,6 +1365,7 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
                 "pct_peak_bandwidth": pct_peak_bandwidth,
                 "arithmetic_intensity": arithmetic_intensity,
                 "ridge_point": ridge_point,
+                "peak_tflops": peak_tflops,
                 "bottleneck": bottleneck,
                 "speedup_vs_pytorch": speedup,
             }
@@ -1444,7 +1459,7 @@ def run_profile(kernel_fn: Callable, config: dict):
 # 8. MAIN -- orchestrate everything and produce structured output
 # =========================================================================
 
-def main():
+def main() -> int:
     t_start = time.time()
 
     parser = argparse.ArgumentParser(description="AutoKernel benchmark harness")
@@ -1664,6 +1679,10 @@ def main():
     if t_elapsed > 90:
         print(f"WARNING: bench.py took {t_elapsed:.1f}s (budget: 90s)")
 
+    # Exit status mirrors the correctness verdict: a failing kernel must not
+    # look like a successful run to the caller.
+    return 0 if correctness_results["correctness"] == "PASS" else 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -85,48 +85,37 @@ grep "correctness\|speedup\|kernel_time_ms\|reference_time_ms\|fast_" run.log
 Think about what to try:
 - Is this a compute-bound or memory-bound operation?
 - Can I fuse multiple operations?
-- Can I use a custom CUDA kernel for the hot path?
+- Can I use a custom Triton kernel for the hot path?
 - What precision should I use?
 
 ### 2.3 Edit kernel.py
 
 Modify `ModelNew.forward()`. Common strategies:
 
-**Strategy A: Custom CUDA C++ kernel**
+**Strategy A: Custom Triton kernel**
 ```python
-from kernels.cuda._compile import compile_cuda
+import triton
+import triton.language as tl
 
-CUDA_SRC = r"""
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-
-__global__ void my_kernel(const float* input, float* output, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) output[idx] = input[idx];
-}
-
-torch::Tensor my_op_cuda(torch::Tensor input) {
-    auto output = torch::empty_like(input);
-    int N = input.numel();
-    my_kernel<<<(N+255)/256, 256>>>(
-        input.data_ptr<float>(), output.data_ptr<float>(), N);
-    return output;
-}
-"""
-
-_mod = None
-def _get_mod():
-    global _mod
-    if _mod is None:
-        _mod = compile_cuda(CUDA_SRC, "my_op_cuda")
-    return _mod
+@triton.jit
+def my_kernel(in_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    x = tl.load(in_ptr + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + offs, tl.maximum(x, 0.0), mask=mask)
 
 class ModelNew(nn.Module):
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
-        return _get_mod().my_op_cuda(x)
+        x = x.contiguous()
+        out = torch.empty_like(x)
+        n = x.numel()
+        BLOCK_SIZE = 1024
+        my_kernel[(triton.cdiv(n, BLOCK_SIZE),)](x, out, n, BLOCK_SIZE=BLOCK_SIZE)
+        return out
 ```
 
 **Strategy B: Triton kernel**
@@ -196,21 +185,28 @@ Go back to 2.2. Each iteration should be one focused change.
 
 These are standalone ops: matmul, relu, conv2d, softmax, layernorm, etc.
 
-**Strategy**: Replace the PyTorch op with a hand-written CUDA C++ kernel.
+**Strategy**: Replace the PyTorch op with a hand-written Triton kernel.
 
 - **Elementwise ops** (relu, gelu, silu, sigmoid, tanh): Trivially parallelizable.
-  Use grid-stride loop, vectorized loads (`float4`), fast math intrinsics.
-  ```cpp
-  __global__ void relu_kernel(const float* in, float* out, int N) {
-      for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += gridDim.x * blockDim.x)
-          out[i] = fmaxf(0.0f, in[i]);
-  }
+  One program per tile, `tl.load`/`tl.store` with a bounds mask.
+  ```python
+  @triton.jit
+  def relu_kernel(in_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+      offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+      mask = offs < N
+      x = tl.load(in_ptr + offs, mask=mask, other=0.0)
+      tl.store(out_ptr + offs, tl.maximum(x, 0.0), mask=mask)
   ```
 
-- **Reductions** (sum, mean, max, min): Warp shuffle + shared memory.
-  Use `__shfl_down_sync` for intra-warp, `__shared__` for inter-warp.
+- **Reductions** (sum, mean, max, min): One program per output row, `tl.sum`/
+  `tl.max` over a `BLOCK_SIZE` tile. If a row is wider than roughly 8192
+  elements it will not fit in registers -- loop over the row in chunks with a
+  `BLOCK_SIZE`-wide accumulator and reduce once at the end. See
+  `ak_kernels/reduce.py` and the chunked variants in `ak_kernels/softmax.py`.
 
-- **Matmul**: Use wmma tensor cores. See `ak_kernels/cuda/matmul.py` for reference.
+- **Matmul**: Tiled `tl.dot` with fp32 accumulators. See `ak_kernels/matmul.py`.
+  Pass `allow_tf32=False` when the inputs are fp32 and the reference is not
+  itself running TF32, or the comparison will fail on precision.
 
 - **Convolutions**: Use `torch.nn.functional.conv2d` with optimal memory format
   (`torch.channels_last`), or write a custom im2col + GEMM kernel.
@@ -225,9 +221,9 @@ These are 3-6 operations chained together: conv+bn+relu, linear+gelu+linear, etc
 **Strategy**: Fuse operations to eliminate intermediate memory traffic.
 
 - Identify the operation chain in `Model.forward()`
-- Write a single CUDA kernel that does all operations without writing intermediates
-- Focus on shared memory tiling for the compute-heavy parts
-- Use fast math intrinsics for activations
+- Write a single Triton kernel that does all operations without writing intermediates
+- Keep the fused epilogue in fp32 registers; only cast on the final store
+- Focus on tiling for the compute-heavy parts
 
 ### Level 3: Full Architectures (hard)
 
@@ -252,112 +248,53 @@ Pre-trained medium-sized models.
 
 ---
 
-## CUDA C++ Tips for KernelBench
-
-### Using AutoKernel's _compile.py
-
-The `compile_cuda()` function from `ak_kernels/cuda/_compile.py` provides:
-- Hash-based caching (only recompiles when source changes)
-- Architecture auto-detection (generates correct -gencode flags)
-- Error diagnostics (prints CUDA source with line numbers on failure)
-- Thread safety
-
-```python
-from kernels.cuda._compile import compile_cuda
-
-CUDA_SRC = r"""
-#include <torch/extension.h>
-// ... your kernel ...
-torch::Tensor my_op_cuda(torch::Tensor x) { ... }
-"""
-
-module = compile_cuda(CUDA_SRC, "my_op_cuda")
-result = module.my_op_cuda(x)
-```
+## Triton Tips for KernelBench
 
 ### Data type handling
 
-KernelBench problems use float32 by default. Handle dtype correctly:
-
-```cpp
-// In CUDA source, accept torch::Tensor (auto-dispatches dtype)
-torch::Tensor my_op_cuda(torch::Tensor input) {
-    // AT_DISPATCH_FLOATING_TYPES dispatches to float, double
-    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "my_op", [&] {
-        my_kernel<<<grid, block>>>(
-            input.data_ptr<scalar_t>(),
-            output.data_ptr<scalar_t>(),
-            N);
-    });
-    return output;
-}
-```
-
-### Multiple outputs
-
-Some problems return tuples of tensors. Use `std::vector<torch::Tensor>`:
-
-```cpp
-std::vector<torch::Tensor> my_op_cuda(torch::Tensor x) {
-    auto out1 = torch::empty_like(x);
-    auto out2 = torch::empty_like(x);
-    // ... kernel calls ...
-    return {out1, out2};
-}
-```
-
-In Python, call as:
-```python
-out1, out2 = module.my_op_cuda(x)
-```
-
-### Handling model parameters
-
-If `Model.__init__` creates nn.Linear, nn.Conv2d, etc., `ModelNew` should keep
-those modules or extract their weights:
+KernelBench problems use float32 by default. Load into fp32 accumulators for
+anything involving a reduction, and cast back on store:
 
 ```python
-class ModelNew(nn.Module):
-    def __init__(self, in_features, out_features):
-        super().__init__()
-        # Keep the linear layer for its weights
-        self.linear = nn.Linear(in_features, out_features)
-
-    def forward(self, x):
-        # Use custom kernel with self.linear.weight and self.linear.bias
-        return _get_mod().my_linear_cuda(x, self.linear.weight, self.linear.bias)
+x = tl.load(in_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+acc = tl.sum(x, axis=0)
+tl.store(out_ptr + row, acc)   # store casts to the output tensor's dtype
 ```
 
----
+For matmuls on fp32 inputs, `tl.dot` defaults to TF32 (10-bit mantissa). That is
+usually fine for KernelBench's 1e-2 tolerance, but pass `allow_tf32=False` if a
+tighter comparison fails.
 
-## Anti-Patterns
+### Block sizes
 
-- **Modifying reference.py** -- never. It's the correctness oracle.
-- **Ignoring correctness** -- always check correctness first. A fast wrong kernel is useless.
-- **Over-optimizing simple ops** -- if PyTorch's implementation is already near-optimal
-  (e.g., simple copy, transpose), focus your time elsewhere.
-- **Forgetting `torch.no_grad()`** -- bench_kb.py wraps calls in `no_grad`, but your
-  kernel should not rely on gradient computation.
-- **Compilation errors** -- if CUDA compilation fails, read the error message carefully.
-  Common issues: missing `#include`, wrong pointer types, mismatched signatures.
-- **Assuming specific tensor shapes** -- always handle the shapes from `get_inputs()`.
-  Don't hardcode dimensions.
-- **Breaking ModelNew.__init__ signature** -- it must accept the same args as Model.__init__.
+`BLOCK_SIZE` must be a power of two. `triton.next_power_of_2(n)` rounds up, but
+do not feed it an unbounded row width: a 50257-element row rounds to 65536,
+which will not fit in registers and fails to compile. Cap it and loop instead.
+
+Sweep `num_warps` (2, 4, 8) and `num_stages` (2-4) as launch arguments -- they
+often matter more than the tile shape.
+
+### Common failure modes
+
+- Forgetting `.contiguous()` before a `view()` on a transposed or sliced tensor.
+- Masking loads but not stores (or vice versa) on ragged tails.
+- Reading a masked-out lane's value: give `tl.load` an `other=` that is neutral
+  for the reduction (`0.0` for sums, `-inf` for maxima).
 
 ---
 
 ## Decision Framework
 
-### When to use CUDA C++ vs Triton vs PyTorch
+### When to use Triton vs PyTorch
 
 | Situation | Best approach |
 |-----------|---------------|
-| Simple elementwise op | CUDA C++ (trivial to write, maximum control) |
-| Reduction | CUDA C++ (warp shuffle gives exact control) |
-| Matmul-like | CUDA C++ with wmma (tensor cores) or Triton |
+| Simple elementwise op | Triton (trivial to write, removes a kernel launch) |
+| Reduction | Triton (control the tiling and accumulator precision) |
+| Matmul-like | Triton `tl.dot` (tensor cores via the compiler) |
 | Conv2d | PyTorch with channels_last format (already optimized) |
-| Multi-op fusion | CUDA C++ (single kernel, no intermediate memory) |
-| Complex architecture | Selective: CUDA for hotspot, PyTorch for rest |
+| Multi-op fusion | Triton (single kernel, no intermediate memory) |
+| Complex architecture | Selective: Triton for the hotspot, PyTorch for the rest |
 
 ### When to move on to the next problem
 

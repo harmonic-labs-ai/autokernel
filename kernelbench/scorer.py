@@ -25,6 +25,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
+
+# Mirrors bridge.py's registry; scorer invokes bridge.py as a subprocess rather
+# than importing it, so the valid backend names are repeated here.
+BACKENDS = ("triton",)
+DEFAULT_BACKEND = "triton"
 WORKSPACE_DIR = PROJECT_DIR / "workspace"
 KB_CACHE_DIR = WORKSPACE_DIR / "kb_cache"
 KB_SCORES_PATH = WORKSPACE_DIR / "kb_scores.json"
@@ -92,7 +97,7 @@ def run_single_problem(
     level: int,
     problem_id: int,
     quick: bool = False,
-    backend: str = "cuda",
+    backend: str = DEFAULT_BACKEND,
 ) -> Dict[str, Any]:
     """
     Set up and evaluate a single KernelBench problem.
@@ -183,7 +188,7 @@ def run_level(
     level: int,
     problem_ids: Optional[List[int]] = None,
     quick: bool = False,
-    backend: str = "cuda",
+    backend: str = DEFAULT_BACKEND,
 ) -> List[Dict[str, Any]]:
     """Run all (or selected) problems in a level."""
 
@@ -316,7 +321,7 @@ def main() -> None:
                         help="Problem range: '1-10' or '1,3,5' (default: all)")
     parser.add_argument("--quick", action="store_true",
                         help="Quick mode for each problem")
-    parser.add_argument("--backend", choices=["cuda", "triton"], default="cuda",
+    parser.add_argument("--backend", choices=sorted(BACKENDS), default=DEFAULT_BACKEND,
                         help="Backend for starter kernels")
     parser.add_argument("--report", action="store_true",
                         help="Just print report from existing results")

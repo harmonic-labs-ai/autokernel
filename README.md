@@ -2,7 +2,7 @@
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/UfEyc72t)
 
-**Autoresearch for GPU kernels.** Give it any PyTorch model, go to sleep, wake up to optimized Triton or CUDA C++ kernels.
+**Autoresearch for GPU kernels.** Give it any PyTorch model, go to sleep, wake up to optimized Triton kernels.
 
 ![AutoKernel Progress](progress.png)
 
@@ -13,7 +13,7 @@ Inspired by [@karpathy/autoresearch](https://github.com/karpathy/autoresearch) -
 Give AutoKernel any PyTorch model. It will:
 
 1. **Profile** the model to find which GPU kernels are bottlenecks
-2. **Extract** each bottleneck as a standalone Triton or CUDA C++ kernel
+2. **Extract** each bottleneck as a standalone Triton kernel
 3. **Optimize** each kernel autonomously (edit, benchmark, keep/revert -- forever)
 4. **Verify** end-to-end correctness and report the total speedup
 
@@ -75,7 +75,7 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | Tool | What it does |
 |------|-------------|
 | `profile_model.py` | Profiles any PyTorch model with `torch.profiler`, ranks kernels by GPU time, classifies as compute/memory-bound |
-| `extract.py` | Extracts top-N bottleneck kernels into standalone Triton or CUDA C++ kernel files (`--backend triton\|cuda`) |
+| `extract.py` | Extracts top-N bottleneck kernels into standalone Triton kernel files |
 | `orchestrate.py` | Multi-kernel scheduler: decides which kernel to optimize next using Amdahl's law, tracks aggregate progress |
 | `bench.py` | Fixed benchmark: 5-stage correctness (smoke, shape sweep, numerical stability, determinism, edge cases) + performance + roofline |
 | `verify.py` | Plugs optimized kernels back into the model, checks end-to-end correctness, reports total speedup |
@@ -96,7 +96,7 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | **rotary_embedding** | Rotary position embeddings (RoPE) | GB/s |
 | **reduce** | Parallel reduction (sum) | GB/s |
 
-Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `ak_kernels/`, and a starter CUDA C++ kernel in `ak_kernels/cuda/`.
+Each has a PyTorch reference in `reference.py` and a starter Triton kernel in `ak_kernels/`.
 
 ## Example Models
 
@@ -143,8 +143,8 @@ uv run kernelbench/scorer.py --level 1
 ```
 
 The agent reads `kernelbench/program_kb.md` for KernelBench-specific optimization instructions:
-how to write `ModelNew` classes, when to use CUDA C++ vs Triton, fusion strategies per problem
-level, and the edit-bench-keep/revert loop adapted for the KernelBench `fast_p` metric.
+how to write `ModelNew` classes, Triton fusion strategies per problem level, and the
+edit-bench-keep/revert loop adapted for the KernelBench `fast_p` metric.
 
 | Tool | What it does |
 |------|-------------|
@@ -191,7 +191,6 @@ autokernel/
   analysis.py           experiment visualization (generates progress.png)
 
   ak_kernels/           starter Triton kernels (9 types)
-  ak_kernels/cuda/      starter CUDA C++ kernels (9 types, tensor core accelerated)
   kernelbench/          KernelBench integration (bridge, eval harness, scorer)
   models/               self-contained model definitions (GPT-2, LLaMA, BERT)
   workspace/            runtime artifacts (gitignored)
@@ -199,7 +198,7 @@ autokernel/
 
 ## Design Choices
 
-**Dual backend: Triton + CUDA C++.** Triton for fast iteration (Python-like syntax, compiles in seconds). CUDA C++ for maximum performance (direct access to tensor cores via `wmma`, PTX intrinsics, shared memory bank-conflict-free layouts). Triton regularly reaches 80-95% of cuBLAS; CUDA C++ can match or exceed it. Both backends share the same `kernel_fn()` interface -- `bench.py` runs identically on either.
+**Triton backend.** Python-like syntax, compiles in seconds, and regularly reaches 80-95% of cuBLAS -- fast enough to iterate hundreds of times a night, which matters more than a last few percent when the loop is the product. Kernels expose a single `kernel_fn()` entry point, and the extraction pipeline is parameterized by backend, so another one can be added without reworking the harness.
 
 **Correctness first.** The benchmark checks kernel output against PyTorch before measuring performance. A fast but wrong kernel is immediately reverted. This prevents the agent from "optimizing" by producing garbage.
 
@@ -228,7 +227,7 @@ Every experiment is logged to `results.tsv` (tab-separated):
 
 ## Credits
 
-This project is **autoresearch for GPU kernels** -- directly inspired by Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), the original experiment in autonomous AI research agents for LLM training. Karpathy showed that an AI agent can run hundreds of experiments overnight, methodically exploring a search space and logging every result. AutoKernel applies that same loop -- agent edits one file, runs a fixed evaluation, keeps or reverts -- to the domain of GPU kernel optimization with Triton and native CUDA C++.
+This project is **autoresearch for GPU kernels** -- directly inspired by Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), the original experiment in autonomous AI research agents for LLM training. Karpathy showed that an AI agent can run hundreds of experiments overnight, methodically exploring a search space and logging every result. AutoKernel applies that same loop -- agent edits one file, runs a fixed evaluation, keeps or reverts -- to the domain of GPU kernel optimization with Triton.
 
 **KernelBench** integration is based on the work of Simon Guo, Sean Resta, et al. at Stanford's Scaling Intelligence Lab. Their paper ["KernelBench: Can LLMs Write GPU Kernels?"](https://arxiv.org/abs/2502.10517) (2025) established the standard benchmark for evaluating AI-generated GPU kernels. AutoKernel extends this by applying iterative optimization (300+ experiments per problem) instead of one-shot generation. KernelBench dataset and evaluation protocol: [ScalingIntelligence/KernelBench](https://github.com/ScalingIntelligence/KernelBench).
 
@@ -244,14 +243,16 @@ Built by [RightNow AI](https://www.rightnowai.co). For enterprise GPU optimizati
 - Fixed Triton rotary_embedding broadcasting truncation
 - Fixed Triton reduce output shape for non-last-dim reductions
 
+### Unreleased
+- Removed the CUDA C++ backend -- Triton only (the pipeline stays backend-parameterized)
+- Fixed 20+ correctness and measurement bugs across the harness and starter kernels
+
 ### v1.2.0
 - Enhanced profiler: `--export-trace`, `--memory-snapshot`, `--torch-compile-log` flags
 - HuggingFace Kernels export via `export_hf.py`
 
 ### v1.1.0
-- Native CUDA C++ backend with 9 starter kernels (tensor cores, warp intrinsics, shared memory tiling)
 - KernelBench integration (250+ standardized GPU kernel problems)
-- `--backend triton|cuda` flag for `extract.py`
 
 ### v1.0.0
 - Initial release: Triton kernel optimization pipeline with 5-stage correctness harness

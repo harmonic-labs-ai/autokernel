@@ -1,5 +1,77 @@
 # Changelog
 
+## Unreleased
+
+### Removed the CUDA C++ backend
+
+Triton is now the only backend. The `ak_kernels/cuda/` starters, the
+`load_inline()` compilation utility, the `--backend cuda` flag, and the CUDA
+export path in `export_hf.py` are gone, along with the `cuda` optional
+dependency and the CUDA C++ playbooks in `program.md` / `kernelbench/program_kb.md`.
+
+The pipeline is still parameterized by backend rather than hardcoded to Triton:
+`extract.py` carries a `BACKENDS` registry and `export_hf.py` an `EXPORTERS`
+map, so a backend can be added back by registering it and dropping starter
+kernels into a subdirectory of `ak_kernels/`. Kernels only declare
+`BACKEND = "..."` when they are not the default, so existing Triton kernels
+need no change.
+
+### Fixed
+
+- `verify.py` crashed with a `TypeError` whenever any kernel in
+  `orchestration_state.json` still had a null `speedup` -- which is its initial
+  value -- taking down end-to-end verification.
+- `_LinearWrapper` re-materialized `weight.t().contiguous()` on every forward,
+  inside the timed region, biasing the end-to-end speedup against the optimized
+  model. The transpose is now done once at wrap time.
+- `softmax`, `cross_entropy`, `layernorm` and `rmsnorm` sized their Triton block
+  as `next_power_of_2(row_width)`, so any row wider than a few thousand elements
+  (a 50257-entry vocabulary rounds to 65536) could not compile. Each now
+  dispatches to a chunked variant above `MAX_FUSED_BLOCK`.
+- The roofline used the fp16 peak for every dtype, understating fp32 kernels'
+  share of peak and misclassifying them as memory-bound. It now uses the peak
+  for the dtype under test.
+- `bench.py` exited 0 even when every correctness stage failed.
+- `orchestrate.py` set a kernel's baseline from the first *kept* experiment,
+  which reports the improved throughput -- pinning the reported speedup at 1.0x
+  and losing the true starting point.
+- A second replacement of the same module type in `verify.py` walked the
+  already-patched tree and double-wrapped each module, while overwriting the
+  saved original so `__exit__` restored a wrapper.
+- `_LayerNormWrapper`/`_RMSNormWrapper` caught `TypeError` to probe call
+  signatures, silently swallowing `TypeError`s raised inside the kernel itself.
+  Signatures are now selected by inspection.
+- The starter `matmul` and `fused_mlp` kernels left `tl.dot` at its default
+  `allow_tf32=True`, running fp32 inputs at TF32 precision against a true-fp32
+  reference and failing the fp32 tolerance.
+- `fused_mlp`'s `gelu` path used the tanh approximation while the reference uses
+  `F.gelu`'s exact erf form.
+- `cross_entropy` ignored `ignore_index=-100`, reading out of bounds on ignored
+  rows instead of excluding them from the mean as `F.cross_entropy` does.
+- `reduce` returned shape `[1]` for a 1-D input where `x.sum(dim=-1)` returns a
+  0-dim scalar.
+- `extract.py`'s `scale_shape` scaled every dimension, including `head_dim` and
+  `vocab`, generating `model_double` shapes the kernels legitimately reject.
+  Only genuine workload dimensions are swept now.
+- Extracted kernels now emit `EDGE_SIZES` derived from the model shape, instead
+  of falling back to bench.py's generic built-in edge sizes.
+- `_compare` accepted a kernel whose output dtype differed from the reference's,
+  because both sides were cast to fp32 first.
+- `_do_bench` passed `warmup`/`rep` to `triton.testing.do_bench`, which reads
+  them as milliseconds, while the fallback path treated them as iteration counts
+  and took a median where do_bench takes a mean.
+- Several GPU entries (3090, 3080, A10, L4, 4090, 4080) carried sparsity-enabled
+  peak TFLOPS, halving the reported `pct_peak_compute`.
+- Row-wise kernels called `view()` without `contiguous()`, raising on
+  non-contiguous inputs that `verify.py`'s wrappers can produce.
+- `rotary_embedding` silently tiled `cos`/`sin` against layouts they do not
+  align with; the broadcast requirement is now asserted.
+- The timeout helper's Windows fallback raised `KeyboardInterrupt`, a
+  `BaseException` that slipped past every `except Exception` handler and aborted
+  the run instead of recording a stage failure. The harness is Unix-only now.
+
+---
+
 ## v1.3.0 -- 2026-03-13
 
 ### AMD ROCm GPU Support (PR #3 by @andyluo7)

@@ -358,7 +358,14 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
         for k in state["kernels"]:
             ktype = k.get("op_type", k.get("type", "unknown"))
             rank = k.get("rank", 0)
-            speedup = k.get("speedup", k.get("best_speedup", 1.0))
+            # These keys exist but are null until a kernel has both a baseline
+            # and a best result, so a plain .get() default is not enough.
+            speedup = k.get("speedup")
+            if speedup is None:
+                speedup = k.get("best_speedup")
+            if speedup is None:
+                speedup = 0.0
+            speedup = float(speedup)
             # optimized_path is not written by orchestrate.py, so derive it
             # from the kernel file path if available
             opt_path = k.get("optimized_path", "")
@@ -431,6 +438,30 @@ def load_kernel_module(path: str) -> Any:
     return mod
 
 
+def _call_kernel(kernel_fn: Callable, candidate_args: List[tuple]):
+    """Call kernel_fn with the first argument list its signature accepts.
+
+    Selection is by inspection rather than by catching TypeError, so a
+    TypeError raised *inside* the kernel propagates instead of being mistaken
+    for a signature mismatch and silently retried with fewer arguments.
+    """
+    try:
+        sig = inspect.signature(kernel_fn)
+    except (TypeError, ValueError):
+        sig = None
+
+    if sig is not None:
+        for args in candidate_args:
+            try:
+                sig.bind(*args)
+            except TypeError:
+                continue
+            return kernel_fn(*args)
+
+    # Signature unavailable (a C callable, say): fall back to the longest form.
+    return kernel_fn(*candidate_args[0])
+
+
 class _LinearWrapper(nn.Module):
     """Wraps nn.Linear to use an optimized matmul kernel_fn."""
 
@@ -440,6 +471,13 @@ class _LinearWrapper(nn.Module):
         self.kernel_fn = kernel_fn
         self.weight = original.weight
         self.bias = original.bias
+        # kernel_fn expects (A, B) with A @ B = C, while nn.Linear stores
+        # weight as [out, in]. Transpose once, here, and as a view: doing it
+        # per-forward copied the whole weight matrix inside the timed region and
+        # charged the optimized model for work the baseline never does, while
+        # caching a .contiguous() copy would double the model's weight memory.
+        # Kernels receive both strides, so a non-contiguous B is fine.
+        self.weight_t = original.weight.t()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Reshape to 2D for kernel_fn, then reshape back
@@ -449,11 +487,7 @@ class _LinearWrapper(nn.Module):
         else:
             x_2d = x
 
-        # kernel_fn expects (A, B) where A @ B = C
-        # For nn.Linear: output = input @ weight.T + bias
-        # So we call kernel_fn(input, weight.T)
-        weight_t = self.weight.t().contiguous()
-        out = self.kernel_fn(x_2d, weight_t)
+        out = self.kernel_fn(x_2d, self.weight_t)
 
         if self.bias is not None:
             out = out + self.bias
@@ -484,16 +518,12 @@ class _LayerNormWrapper(nn.Module):
         else:
             x_2d = x
 
-        try:
-            # Try full signature: kernel_fn(x, weight, bias, eps)
-            out = self.kernel_fn(x_2d, self.weight, self.bias, self.eps)
-        except TypeError:
-            try:
-                # Try without eps: kernel_fn(x, weight, bias)
-                out = self.kernel_fn(x_2d, self.weight, self.bias)
-            except TypeError:
-                # Fallback: just x
-                out = self.kernel_fn(x_2d)
+        out = _call_kernel(
+            self.kernel_fn,
+            [(x_2d, self.weight, self.bias, self.eps),
+             (x_2d, self.weight, self.bias),
+             (x_2d,)],
+        )
 
         if len(orig_shape) > 2:
             out = out.reshape(orig_shape)
@@ -520,10 +550,10 @@ class _RMSNormWrapper(nn.Module):
             x_2d = x
 
         if self.weight is not None:
-            try:
-                out = self.kernel_fn(x_2d, self.weight, self.eps)
-            except TypeError:
-                out = self.kernel_fn(x_2d, self.weight)
+            out = _call_kernel(
+                self.kernel_fn,
+                [(x_2d, self.weight, self.eps), (x_2d, self.weight)],
+            )
         else:
             out = self.kernel_fn(x_2d)
 
@@ -570,13 +600,10 @@ class OptimizedModelContext:
         return self.model
 
     def __exit__(self, *exc):
-        # Restore all original modules
-        for name, original in self._original_modules.items():
-            parts = name.split(".")
-            parent = self.model
-            for p in parts[:-1]:
-                parent = getattr(parent, p)
-            setattr(parent, parts[-1], original)
+        # Restore all original modules, deepest path first so a nested
+        # replacement is never reinstalled onto an already-restored parent.
+        for name in sorted(self._original_modules, key=lambda n: -n.count(".")):
+            self._install(name, self._original_modules[name])
         self._original_modules.clear()
         self._applied.clear()
 
@@ -598,51 +625,67 @@ class OptimizedModelContext:
 
         return count
 
-    def _replace_linear_modules(self, repl: KernelReplacement) -> int:
-        """Replace all nn.Linear modules with optimized matmul wrapper."""
+    def _install(self, name: str, wrapper: nn.Module) -> None:
+        """Swap the module at a dotted path for its wrapper."""
+        parts = name.split(".")
+        parent = self.model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], wrapper)
+
+    def _is_inside_wrapper(self, name: str) -> bool:
+        """True if this module lives under a module we already replaced."""
+        return any(
+            name == patched or name.startswith(patched + ".")
+            for patched in self._original_modules
+        )
+
+    def _replace_matching(
+        self,
+        repl: "KernelReplacement",
+        matches: Callable[[str, nn.Module], bool],
+        make_wrapper: Callable[[nn.Module, Callable], nn.Module],
+    ) -> int:
+        """Replace every module satisfying `matches`, skipping already-wrapped
+        subtrees so a second replacement of the same type cannot double-wrap."""
         count = 0
         for name, module in list(self.model.named_modules()):
-            if isinstance(module, nn.Linear):
-                # Save original
+            if not name or self._is_inside_wrapper(name):
+                continue
+            if matches(name, module):
                 self._original_modules[name] = module
-                # Create wrapper
-                wrapper = _LinearWrapper(module, repl.module_fn)
-                # Install wrapper
-                parts = name.split(".")
-                parent = self.model
-                for p in parts[:-1]:
-                    parent = getattr(parent, p)
-                setattr(parent, parts[-1], wrapper)
+                self._install(name, make_wrapper(module, repl.module_fn))
                 count += 1
         return count
 
+    def _replace_linear_modules(self, repl: KernelReplacement) -> int:
+        """Replace all nn.Linear modules with optimized matmul wrapper."""
+        return self._replace_matching(
+            repl,
+            lambda name, m: isinstance(m, nn.Linear),
+            _LinearWrapper,
+        )
+
     def _replace_layernorm_modules(self, repl: KernelReplacement) -> int:
         """Replace all nn.LayerNorm modules with optimized wrapper."""
-        count = 0
-        for name, module in list(self.model.named_modules()):
-            if isinstance(module, nn.LayerNorm):
-                self._original_modules[name] = module
-                wrapper = _LayerNormWrapper(module, repl.module_fn)
-                parts = name.split(".")
-                parent = self.model
-                for p in parts[:-1]:
-                    parent = getattr(parent, p)
-                setattr(parent, parts[-1], wrapper)
-                count += 1
-        return count
+        return self._replace_matching(
+            repl,
+            lambda name, m: isinstance(m, nn.LayerNorm),
+            _LayerNormWrapper,
+        )
 
     def _replace_rmsnorm_modules(self, repl: KernelReplacement) -> int:
         """
         Replace RMSNorm modules. Since there is no standard nn.RMSNorm,
         we look for common class names and attributes.
         """
-        count = 0
         rmsnorm_names = {"RMSNorm", "LlamaRMSNorm", "T5LayerNorm", "GemmaRMSNorm"}
 
-        for name, module in list(self.model.named_modules()):
+        def _matches(name: str, module: nn.Module) -> bool:
             cls_name = type(module).__name__
-            # Match by class name or by having 'weight' but no 'bias' and a norm-like name
-            is_rmsnorm = (
+            # Match by class name, or by having 'weight' but no 'bias' and a
+            # norm-like class name.
+            return (
                 cls_name in rmsnorm_names
                 or (hasattr(module, "weight")
                     and hasattr(module, "eps")
@@ -651,16 +694,7 @@ class OptimizedModelContext:
                     and not isinstance(module, nn.LayerNorm))
             )
 
-            if is_rmsnorm:
-                self._original_modules[name] = module
-                wrapper = _RMSNormWrapper(module, repl.module_fn)
-                parts = name.split(".")
-                parent = self.model
-                for p in parts[:-1]:
-                    parent = getattr(parent, p)
-                setattr(parent, parts[-1], wrapper)
-                count += 1
-        return count
+        return self._replace_matching(repl, _matches, _RMSNormWrapper)
 
     @property
     def applied_summary(self) -> List[str]:

@@ -7,7 +7,6 @@ Usage:
     uv run extract.py --top 5                  # extract only top-5 kernels
     uv run extract.py --kernel-type matmul     # extract only matmul kernels
     uv run extract.py --report path/to/report.json
-    uv run extract.py --backend cuda           # use CUDA C++ starter kernels instead of Triton
     uv run extract.py --dtype bfloat16         # override the profiled dtype
 """
 
@@ -29,6 +28,25 @@ WORKSPACE_DIR = os.path.join(SCRIPT_DIR, "workspace")
 KERNELS_DIR = os.path.join(SCRIPT_DIR, "ak_kernels")
 DEFAULT_REPORT_PATH = os.path.join(WORKSPACE_DIR, "profile_report.json")
 OPTIMIZATION_PLAN_PATH = os.path.join(WORKSPACE_DIR, "optimization_plan.json")
+
+
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+# Triton is the only backend today. The pipeline stays parameterized by backend
+# so another one can be added by dropping its starter kernels into a
+# subdirectory of ak_kernels/ and registering it here:
+#
+#   "cuda": {"label": "CUDA C++", "subdir": "cuda", "declare": True},
+#
+# `subdir` is relative to ak_kernels/ ("" means the top level). `declare`
+# controls whether generated kernels get an explicit `BACKEND = "..."` line;
+# bench.py treats a missing BACKEND as the default backend.
+
+BACKENDS: Dict[str, Dict[str, Any]] = {
+    "triton": {"label": "Triton", "subdir": "", "declare": False},
+}
+DEFAULT_BACKEND = "triton"
 
 
 # ---------------------------------------------------------------------------
@@ -385,12 +403,50 @@ def shape_to_display(shape: Dict[str, int]) -> str:
     return ", ".join(f"{k}={v}" for k, v in shape.items())
 
 
+# The model_half/model_double sizes exist to check that a kernel holds up as
+# the workload grows, so only the dimensions that actually vary at inference
+# time are swept. Everything else -- head_dim, vocab, hidden width, weight
+# shapes -- is fixed by the architecture; scaling those produces shapes the
+# model never runs and, for head_dim, shapes the kernels legitimately refuse
+# (a doubled head_dim of 256 or a halved 48 is not a valid attention layout).
+SWEEP_DIMS = frozenset({"batch", "seq_len", "rows", "M"})
+
+
 def scale_shape(shape: Dict[str, int], factor: float) -> Dict[str, int]:
     """
-    Scale all shape dimensions by a factor, rounding to nearest integer.
-    Ensures all values are at least 1.
+    Scale the workload dimensions of a shape by a factor, rounding to nearest.
+    Architectural dimensions (anything outside SWEEP_DIMS) are left alone. All
+    values stay at least 1.
     """
-    return {k: max(1, int(round(v * factor))) for k, v in shape.items()}
+    return {
+        k: max(1, int(round(v * factor))) if k in SWEEP_DIMS else v
+        for k, v in shape.items()
+    }
+
+
+def edge_shapes(shape: Dict[str, int]) -> List[Tuple[str, Dict[str, int]]]:
+    """Derive non-power-of-2 edge shapes from the model shape.
+
+    Stage 5 exists to catch masking and tail-handling bugs. Without these the
+    generated kernel falls back to bench.py's built-in edge sizes, which are
+    generic shapes unrelated to the model being optimized.
+    """
+    sweepable = [k for k in shape if k in SWEEP_DIMS]
+    if not sweepable:
+        return []
+
+    edges: List[Tuple[str, Dict[str, int]]] = []
+    for delta, label in ((-1, "minus_one"), (+1, "plus_one")):
+        variant = dict(shape)
+        changed = False
+        for k in sweepable:
+            scaled = max(1, variant[k] + delta)
+            if scaled != variant[k]:
+                variant[k] = scaled
+                changed = True
+        if changed and variant not in [v for _, v in edges]:
+            edges.append((f"edge_{label}", variant))
+    return edges
 
 
 def get_default_shape(op_type: str) -> Dict[str, int]:
@@ -565,16 +621,19 @@ def order_test_dtypes(op_type: str, model_dtype: str) -> List[str]:
     return [model_dtype] + [d for d in candidates if d != model_dtype]
 
 
-def read_starter_kernel(op_type: str, backend: str = "triton") -> Optional[str]:
-    """Read the starter kernel file. Returns None if not found.
+def starter_kernel_dir(backend: str = DEFAULT_BACKEND) -> str:
+    """Directory holding the starter kernels for a backend.
 
-    For backend='triton': reads from ak_kernels/{op_type}.py
-    For backend='cuda':   reads from ak_kernels/cuda/{op_type}.py
+    Triton starters live at the top of ak_kernels/. A future backend would add
+    its own subdirectory here and register itself in BACKENDS.
     """
-    if backend == "cuda":
-        path = os.path.join(KERNELS_DIR, "cuda", f"{op_type}.py")
-    else:
-        path = os.path.join(KERNELS_DIR, f"{op_type}.py")
+    subdir = BACKENDS[backend]["subdir"]
+    return os.path.join(KERNELS_DIR, subdir) if subdir else KERNELS_DIR
+
+
+def read_starter_kernel(op_type: str, backend: str = DEFAULT_BACKEND) -> Optional[str]:
+    """Read the starter kernel file for this op/backend. None if not found."""
+    path = os.path.join(starter_kernel_dir(backend), f"{op_type}.py")
     if not os.path.exists(path):
         return None
     with open(path, "r", encoding="utf-8") as f:
@@ -617,7 +676,7 @@ def generate_kernel_file(
     model_name: str,
     gpu_time_ms: float,
     starter_code: str,
-    backend: str = "triton",
+    backend: str = DEFAULT_BACKEND,
     model_dtype: str = "float16",
     shape_source: str = "profiled",
 ) -> str:
@@ -674,8 +733,8 @@ def generate_kernel_file(
 
     # KERNEL_TYPE and BACKEND
     lines.append(f'KERNEL_TYPE = "{op_type}"')
-    if backend == "cuda":
-        lines.append(f'BACKEND = "cuda"')
+    if BACKENDS[backend]["declare"]:
+        lines.append(f'BACKEND = "{backend}"')
     lines.append("")
 
     # Model-specific shapes
@@ -694,6 +753,17 @@ def generate_kernel_file(
     lines.append(f'    ("model_double", {repr(double_shape)}),')
     lines.append("]")
     lines.append("")
+
+    # Edge sizes: non-power-of-2 variants of the model shape, so stage 5
+    # exercises this kernel's masking rather than generic fallback shapes.
+    edges = edge_shapes(model_shape)
+    if edges:
+        lines.append("# Non-power-of-2 shapes for the edge-case stage.")
+        lines.append("EDGE_SIZES = [")
+        for label, sz in edges:
+            lines.append(f'    ("{label}", {repr(sz)}),')
+        lines.append("]")
+        lines.append("")
 
     # Dtypes (model dtype first -- bench.py measures with TEST_DTYPES[0])
     lines.append("# Model dtype first: bench.py measures performance with TEST_DTYPES[0].")
@@ -719,9 +789,11 @@ def generate_kernel_file(
     # Separator
     lines.append("")
     lines.append(f"# {'=' * 70}")
-    backend_label = "CUDA C++" if backend == "cuda" else "Triton"
-    backend_dir = f"ak_kernels/cuda/{op_type}.py" if backend == "cuda" else f"ak_kernels/{op_type}.py"
-    lines.append(f"# {backend_label} kernel code (from {backend_dir})")
+    backend_label = BACKENDS[backend]["label"]
+    starter_rel = os.path.relpath(
+        os.path.join(starter_kernel_dir(backend), f"{op_type}.py"), SCRIPT_DIR
+    )
+    lines.append(f"# {backend_label} kernel code (from {starter_rel})")
     lines.append(f"# {'=' * 70}")
     lines.append("")
 
@@ -815,12 +887,16 @@ def extract_kernels(
     report_path: str,
     top_n: Optional[int] = None,
     kernel_type_filter: Optional[str] = None,
-    backend: str = "triton",
+    backend: str = DEFAULT_BACKEND,
     dtype_override: Optional[str] = None,
 ) -> None:
     """Main extraction pipeline."""
 
-    backend_label = "CUDA C++" if backend == "cuda" else "Triton"
+    if backend not in BACKENDS:
+        raise ValueError(
+            f"Unknown backend {backend!r}. Available: {sorted(BACKENDS)}"
+        )
+    backend_label = BACKENDS[backend]["label"]
     print(f"=== AutoKernel Kernel Extractor ({backend_label}) ===")
     print()
 
@@ -928,7 +1004,7 @@ def extract_kernels(
         # Read starter kernel
         starter_code = read_starter_kernel(op_type, backend=backend)
         if starter_code is None:
-            starter_dir = "ak_kernels/cuda" if backend == "cuda" else "ak_kernels"
+            starter_dir = os.path.relpath(starter_kernel_dir(backend), SCRIPT_DIR)
             print(f"  WARNING: No starter kernel found at {starter_dir}/{op_type}.py -- skipping.")
             skipped += 1
             continue
@@ -965,7 +1041,7 @@ def extract_kernels(
         print(f"  [{position}/{total}] {op_type} (rank {rank}, {pct_total}%) "
               f"-> {output_relpath}")
         print(f"        Model shape: {shape_display}{shape_note}")
-        starter_dir = "ak_kernels/cuda" if backend == "cuda" else "ak_kernels"
+        starter_dir = os.path.relpath(starter_kernel_dir(backend), SCRIPT_DIR)
         print(f"        Based on: {starter_dir}/{op_type}.py")
         print()
 
@@ -1031,9 +1107,9 @@ def main() -> None:
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["triton", "cuda"],
-        default="triton",
-        help="Backend for starter kernels: 'triton' (default) or 'cuda' (native CUDA C++)",
+        choices=sorted(BACKENDS),
+        default=DEFAULT_BACKEND,
+        help=f"Backend for starter kernels (default: {DEFAULT_BACKEND})",
     )
     parser.add_argument(
         "--dtype",

@@ -504,20 +504,20 @@ def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: 
     # Update experiment counts
     target["experiments_run"] += 1
 
+    # The first experiment that produced a number defines the baseline. A keep
+    # reports the *improved* throughput, so deferring this to the keep branch
+    # would set baseline == best and pin the speedup at 1.0x forever.
+    if target["baseline_tflops"] is None and not is_failure:
+        target["baseline_tflops"] = throughput_tflops
+
     if is_kept:
         target["experiments_kept"] += 1
         target["consecutive_reverts"] = 0
         # Update best if improved
         if target["best_tflops"] is None or throughput_tflops > target["best_tflops"]:
             target["best_tflops"] = throughput_tflops
-        # Set baseline on first kept result if not already set
-        if target["baseline_tflops"] is None:
-            target["baseline_tflops"] = throughput_tflops
     elif is_revert:
         target["consecutive_reverts"] += 1
-        # First experiment sets the baseline even on revert
-        if target["baseline_tflops"] is None:
-            target["baseline_tflops"] = throughput_tflops
         if target["best_tflops"] is None:
             target["best_tflops"] = throughput_tflops
     elif is_failure:
@@ -555,7 +555,7 @@ def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: 
         "throughput_tflops": f"{throughput_tflops:.4f}" if throughput_tflops else "0",
         "latency_us": "",
         "pct_peak": "",
-        "speedup_vs_pytorch": f"{target['speedup']:.3f}" if target["speedup"] else "",
+        "speedup_vs_pytorch": f"{target['speedup']:.3f}" if target["speedup"] is not None else "",
         "correctness": correctness,
         "peak_vram_mb": "",
         "description": description,
@@ -567,7 +567,7 @@ def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: 
     # Summary
     kname = Path(target["file"]).name
     print(f"Recorded: {kname} exp #{target['experiments_run']} -> {tag_label} ({throughput_tflops:.2f} TFLOPS)")
-    if target["speedup"]:
+    if target["speedup"] is not None:
         print(f"  Speedup: {target['speedup']:.2f}x | Best: {target['best_tflops']:.2f} TFLOPS")
     if target["consecutive_reverts"] > 0 and not is_kept:
         print(f"  Consecutive reverts: {target['consecutive_reverts']}"

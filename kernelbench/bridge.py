@@ -39,6 +39,12 @@ KB_CACHE_DIR = WORKSPACE_DIR / "kb_cache"
 KB_ACTIVE_DIR = WORKSPACE_DIR / "kb_active"
 KERNEL_PY = PROJECT_DIR / "kernel.py"
 
+# Backends a generated ModelNew starter can target. Triton is the only one
+# today; see extract.py's BACKENDS for the matching registry on the
+# profile -> extract path.
+BACKENDS = ("triton",)
+DEFAULT_BACKEND = "triton"
+
 
 # ---------------------------------------------------------------------------
 # Problem data structure
@@ -203,7 +209,7 @@ class KernelBenchProblem:
 
     # ----- Starter generation -----
 
-    def generate_starter(self, backend: str = "cuda") -> str:
+    def generate_starter(self, backend: str = DEFAULT_BACKEND) -> str:
         """Generate a starter kernel.py (ModelNew initially copies Model logic)."""
         analysis = self.analyze()
         ops_str = ", ".join(analysis["operations"]) or "unknown"
@@ -218,7 +224,7 @@ Source: ScalingIntelligence/KernelBench
 Optimized with AutoKernel (https://github.com/RightNow-AI/autokernel)
 
 The agent optimizes ModelNew to outperform the PyTorch reference (Model).
-Edit ModelNew.forward() -- use CUDA C++ via compile_cuda() or Triton @jit.
+Edit ModelNew.forward() -- write Triton kernels with @triton.jit.
 Run `uv run kernelbench/bench_kb.py` to evaluate correctness + speedup.
 """
 
@@ -253,39 +259,7 @@ import torch.nn.functional as F
         # Build ModelNew by copying Model class
         model_new_source = self._extract_and_rename_model()
 
-        compile_hint = ""
-        if backend == "cuda":
-            compile_hint = """
-# Optional: use AutoKernel's CUDA compilation utility for custom CUDA C++ kernels
-# from kernels.cuda._compile import compile_cuda
-#
-# CUDA_SRC = r\"""
-# #include <torch/extension.h>
-# #include <cuda_runtime.h>
-# #include <cuda_fp16.h>
-#
-# __global__ void my_kernel(const float* input, float* output, int N) {
-#     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-#     if (idx < N) output[idx] = input[idx];
-# }
-#
-# torch::Tensor my_op_cuda(torch::Tensor input) {
-#     auto output = torch::empty_like(input);
-#     int N = input.numel();
-#     my_kernel<<<(N+255)/256, 256>>>(input.data_ptr<float>(), output.data_ptr<float>(), N);
-#     return output;
-# }
-# \"""
-# _mod = None
-# def _get_mod():
-#     global _mod
-#     if _mod is None:
-#         _mod = compile_cuda(CUDA_SRC, "my_op_cuda")
-#     return _mod
-"""
-
         return f"""{header}
-{compile_hint}
 # ============================================================================
 # Reference implementation (DO NOT MODIFY below this line)
 # ============================================================================
@@ -297,7 +271,7 @@ import torch.nn.functional as F
 # ============================================================================
 
 # ModelNew must produce outputs matching Model within atol=1e-2, rtol=1e-2.
-# Start by copying Model's logic, then optimize with CUDA C++ or Triton.
+# Start by copying Model's logic, then optimize with Triton.
 
 {model_new_source}
 """
@@ -492,7 +466,7 @@ def get_problem(level: int, problem_id: int) -> Optional[KernelBenchProblem]:
 # Workspace setup
 # ---------------------------------------------------------------------------
 
-def setup_problem(problem: KernelBenchProblem, backend: str = "cuda") -> None:
+def setup_problem(problem: KernelBenchProblem, backend: str = DEFAULT_BACKEND) -> None:
     """
     Set up workspace for optimizing a KernelBench problem.
 
@@ -578,7 +552,7 @@ def main() -> None:
     setup_p = sub.add_parser("setup", help="Set up workspace for a problem")
     setup_p.add_argument("--level", type=int, required=True)
     setup_p.add_argument("--problem", type=int, required=True)
-    setup_p.add_argument("--backend", choices=["cuda", "triton"], default="cuda")
+    setup_p.add_argument("--backend", choices=sorted(BACKENDS), default=DEFAULT_BACKEND)
     setup_p.add_argument(
         "--source", choices=["hf", "local", "file"], default=None,
         help="Auto-fetch from this source if problem not in cache",

@@ -76,8 +76,8 @@ def fused_gate_up_kernel(
         wu_mask = (k_offs[:, None] < K) & (offs_n[None, :] < N)
         wu = tl.load(wu_ptrs, mask=wu_mask, other=0.0)
 
-        acc_gate += tl.dot(x, wg)
-        acc_up += tl.dot(x, wu)
+        acc_gate += tl.dot(x, wg, allow_tf32=False)
+        acc_up += tl.dot(x, wu, allow_tf32=False)
 
         x_ptrs += BLOCK_SIZE_K * stride_xk
         wg_ptrs += BLOCK_SIZE_K * stride_wgk
@@ -88,8 +88,9 @@ def fused_gate_up_kernel(
         # SiLU(x) = x * sigmoid(x)
         gate_activated = acc_gate * tl.sigmoid(acc_gate)
     else:
-        # GELU approximation
-        gate_activated = 0.5 * acc_gate * (1.0 + tl.math.tanh(0.7978845608 * (acc_gate + 0.044715 * acc_gate * acc_gate * acc_gate)))
+        # Exact GELU, matching F.gelu's default (erf form, not the tanh
+        # approximation): 0.5 * x * (1 + erf(x / sqrt(2)))
+        gate_activated = 0.5 * acc_gate * (1.0 + tl.math.erf(acc_gate * 0.7071067811865476))
 
     result = gate_activated * acc_up
 
@@ -124,6 +125,7 @@ def kernel_fn(
 
     # Handle multi-dim input
     orig_shape = x.shape
+    x = x.contiguous()
     if x.ndim > 2:
         x = x.view(-1, x.shape[-1])
 

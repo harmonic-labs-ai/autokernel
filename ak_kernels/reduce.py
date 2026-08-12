@@ -81,11 +81,10 @@ def kernel_fn(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     # Make contiguous and reshape
     x_contig = x.contiguous()
 
-    # Output shape: same as input but with dim removed
+    # Output shape: same as input but with dim removed. Reducing a 1-D tensor
+    # leaves an empty shape -- a 0-dim scalar, matching x.sum(dim=...).
     out_shape = list(x.shape)
     out_shape.pop(dim)
-    if len(out_shape) == 0:
-        out_shape = [1]
 
     # Total number of output elements
     n_output = outer_size * inner_size
