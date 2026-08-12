@@ -798,6 +798,88 @@ def _has_nan_inf(t: torch.Tensor) -> bool:
     return bool(torch.isnan(t).any().item() or torch.isinf(t).any().item())
 
 
+def _to_fp64(inputs: dict) -> dict:
+    """Upcast floating-point tensors to float64, leaving everything else alone."""
+    return {
+        k: (v.double() if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
+        for k, v in inputs.items()
+    }
+
+
+def _compare_conditioned(
+    output: torch.Tensor,
+    expected: torch.Tensor,
+    truth: torch.Tensor,
+    atol: float,
+    rtol: float,
+    worse_factor: float = 4.0,
+) -> Optional[dict]:
+    """Compare against an fp64 ground truth instead of a same-dtype reference.
+
+    Adversarial inputs (mixed_scale spans a 1e12 dynamic range) make reductions
+    catastrophically ill-conditioned: summing terms of magnitude ~1e6 into a
+    result near zero leaves an absolute rounding error set by the *partial sums*,
+    not by the result. At those elements the same-dtype PyTorch reference is
+    itself wrong by orders of magnitude more than any tolerance that is
+    meaningful for the real shapes, so a direct kernel-vs-reference comparison
+    measures accumulated rounding noise rather than kernel error -- and fails
+    kernels that are strictly more accurate than the reference.
+
+    So: grade the kernel against fp64 truth, ignore elements that the reference
+    itself cannot resolve, and separately guard that the kernel is not globally
+    worse than the reference it replaces.
+
+    Returns None if the truth is unusable, so the caller can fall back to the
+    ordinary comparison.
+    """
+    if output.shape != truth.shape or expected.shape != truth.shape:
+        return None
+    t = truth.double()
+    if not bool(torch.isfinite(t).all().item()):
+        return None
+
+    err_out = (output.double() - t).abs()
+    err_ref = (expected.double() - t).abs()
+    tolmap = atol + rtol * t.abs()
+
+    # Elements where the same-dtype reference already busts the tolerance are
+    # ill-conditioned; no correct kernel can be held to that bar there.
+    ill = err_ref > tolmap
+    bad = (err_out > tolmap) & ~ill
+    n_bad = int(bad.sum().item())
+
+    max_out = err_out.max().item()
+    max_ref = err_ref.max().item()
+    mean_out = err_out.mean().item()
+    mean_ref = err_ref.mean().item()
+
+    # Global guard: catch a kernel that is uniformly worse than the reference
+    # even though it never violates the tolerance on a well-conditioned element.
+    ceiling = max(max_ref, tolmap.max().item()) * worse_factor
+    globally_worse = max_out > ceiling
+
+    match = (n_bad == 0) and not globally_worse
+    if match:
+        reason = ""
+    elif globally_worse:
+        reason = (f"kernel error {max_out:.3e} exceeds {worse_factor}x the reference's "
+                  f"own error {max_ref:.3e} vs fp64 truth")
+    else:
+        reason = (f"{n_bad} well-conditioned elements exceed tol(atol={atol}, rtol={rtol}); "
+                  f"max_err={max_out:.3e} vs fp64 truth")
+
+    return {
+        "match": match,
+        "reason": reason,
+        "max_abs_error": max_out,
+        "mean_abs_error": mean_out,
+        "ref_max_abs_error": max_ref,
+        "ref_mean_abs_error": mean_ref,
+        "n_ill_conditioned": int(ill.sum().item()),
+        "n_bad": n_bad,
+    }
+
+
 def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> dict:
     """Run all correctness stages. Returns dict with results."""
     device = "cuda"
@@ -1002,9 +1084,33 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
                 # Relax tolerances for adversarial inputs
                 relaxed_atol = tol["atol"] * 10
                 relaxed_rtol = tol["rtol"] * 10
-                cmp = _compare(output, expected, atol=relaxed_atol, rtol=relaxed_rtol)
+
+                # Grade against an fp64 ground truth where we can get one: on
+                # these adversarial inputs the same-dtype reference is often
+                # itself far from the true answer, so kernel-vs-reference
+                # measures rounding noise rather than kernel error.
+                cmp = None
+                try:
+                    truth = ref_fn(_to_fp64(transformed))
+                    cmp = _compare_conditioned(
+                        output, expected, truth,
+                        atol=relaxed_atol, rtol=relaxed_rtol,
+                    )
+                    del truth
+                except (torch.cuda.OutOfMemoryError, RuntimeError, TypeError, ValueError):
+                    cmp = None  # fp64 unavailable for this op -- fall back below
+                finally:
+                    torch.cuda.empty_cache()
+
+                if cmp is None:
+                    cmp = _compare(output, expected, atol=relaxed_atol, rtol=relaxed_rtol)
+                    graded = "vs reference"
+                else:
+                    graded = (f"vs fp64 truth; ref err={cmp['ref_max_abs_error']:.2e}, "
+                              f"{cmp['n_ill_conditioned']} ill-conditioned elems")
+
                 if cmp["match"]:
-                    print(f"  PASS: {case_name} (max_err={cmp['max_abs_error']:.2e})")
+                    print(f"  PASS: {case_name} (max_err={cmp['max_abs_error']:.2e}, {graded})")
                 else:
                     stability_pass = False
                     details.append(f"  stability {case_name}: {cmp['reason']}")
