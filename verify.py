@@ -103,6 +103,13 @@ REL_L2_TOLERANCES: Dict[torch.dtype, float] = {
     torch.float32:  1e-5,
 }
 
+# Threshold for the RoPE patch's self-check. Tighter than the end-to-end
+# figures above because it compares one op's output directly against the
+# function it replaces, with no depth amplification in between: rounding
+# differences land near 1e-3, and a mismodelled variant (wrong mrope sectioning,
+# wrong rotation, wrong broadcast) moves the whole tensor and lands near 1.
+_ROPE_PATCH_REL_L2_TOL = 1e-2
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -683,19 +690,24 @@ class _RoPEFunctionPatch:
     in the module tree. This patches the function on the modeling module
     instead, and restores it on exit.
 
-    Only the standard `(q, k, cos, sin, ...)` form is patched. Variants that
-    preprocess cos/sin first -- Qwen2-VL's `apply_multimodal_rotary_pos_emb`
-    slices them into mrope sections -- are left alone rather than guessed at,
-    since reproducing that reshaping wrongly would corrupt results silently.
+    The variants differ only in how they preprocess cos/sin before applying
+    them -- Qwen2-VL's `apply_multimodal_rotary_pos_emb` slices them into
+    temporal/height/width mrope sections first -- and never in how they touch
+    q/k, which is always `(x * cos) + (rotate_half(x) * sin)`. So the
+    preprocessing is reproduced here, and then *checked against the function it
+    replaces* on the first call: if the two disagree, the patch permanently
+    steps aside and the model keeps its own implementation. That way a variant
+    this code models wrongly costs a warning and the speedup, never silent
+    corruption -- including for variants that do not exist yet.
     """
-
-    _NAMES = ("apply_rotary_pos_emb",)
 
     def __init__(self, model: nn.Module, kernel_fn: Callable):
         self.kernel_fn = kernel_fn
         self.model = model
         self._saved: List[Tuple[Any, str, Callable]] = []
         self.skipped: List[str] = []
+        # Populated by the first-call self-check, for reporting afterwards.
+        self.rejected: List[str] = []
 
     def _target_modules(self) -> List[Any]:
         seen, out = set(), []
@@ -718,21 +730,90 @@ class _RoPEFunctionPatch:
                 fn = getattr(py_mod, attr, None)
                 if not callable(fn):
                     continue
-                if attr not in self._NAMES:
-                    self.skipped.append(f"{py_mod.__name__}.{attr}")
+                # The vision tower has its own RoPE entry point. Optimizing a
+                # VLM's language backbone must leave it untouched.
+                if "vision" in attr:
+                    self.skipped.append(f"{py_mod.__name__}.{attr} (vision tower)")
                     continue
                 self._saved.append((py_mod, attr, fn))
-                setattr(py_mod, attr, self._make_patched())
+                setattr(py_mod, attr, self._make_patched(fn, f"{py_mod.__name__}.{attr}"))
                 count += 1
         return count
 
-    def _make_patched(self) -> Callable:
-        kernel_fn = self.kernel_fn
+    def _prepare_cos_sin(self, cos, sin, mrope_section, unsqueeze_dim):
+        """Reproduce the variant's cos/sin preprocessing."""
+        if mrope_section is not None:
+            section = list(mrope_section) * 2
+            cos = torch.cat(
+                [m[i % 3] for i, m in enumerate(cos.split(section, dim=-1))], dim=-1
+            )
+            sin = torch.cat(
+                [m[i % 3] for i, m in enumerate(sin.split(section, dim=-1))], dim=-1
+            )
+        return cos.unsqueeze(unsqueeze_dim), sin.unsqueeze(unsqueeze_dim)
 
-        def patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-            cos = cos.unsqueeze(unsqueeze_dim)
-            sin = sin.unsqueeze(unsqueeze_dim)
-            return kernel_fn(q, cos, sin), kernel_fn(k, cos, sin)
+    def _make_patched(self, original_fn: Callable, label: str) -> Callable:
+        kernel_fn = self.kernel_fn
+        rejected = self.rejected
+        prepare = self._prepare_cos_sin
+        try:
+            sig = inspect.signature(original_fn)
+        except (TypeError, ValueError):
+            sig = None
+        state = {"checked": False, "use_kernel": True}
+
+        def run_kernel(q, k, cos, sin, args, kwargs):
+            mrope_section = None
+            unsqueeze_dim = 1
+            if sig is not None:
+                bound = sig.bind(q, k, cos, sin, *args, **kwargs)
+                bound.apply_defaults()
+                mrope_section = bound.arguments.get("mrope_section")
+                unsqueeze_dim = bound.arguments.get("unsqueeze_dim", 1)
+            c, s = prepare(cos, sin, mrope_section, unsqueeze_dim)
+            return kernel_fn(q, c, s), kernel_fn(k, c, s)
+
+        def patched(q, k, cos, sin, *args, **kwargs):
+            if not state["use_kernel"]:
+                return original_fn(q, k, cos, sin, *args, **kwargs)
+
+            if not state["checked"]:
+                state["checked"] = True
+                ref_q, ref_k = original_fn(q, k, cos, sin, *args, **kwargs)
+                reason = ""
+                try:
+                    got_q, got_k = run_kernel(q, k, cos, sin, args, kwargs)
+                    # Judge on relative L2, not elementwise allclose. A kernel
+                    # that accumulates in fp32 differs from an eager bf16
+                    # implementation by rounding on every element, so a
+                    # per-element bound either rejects a correct kernel or has
+                    # to be loosened past the point of catching anything. The
+                    # norm separates the two cases cleanly: rounding lands near
+                    # 1e-3, a different function lands near 1.
+                    worst = 0.0
+                    for r, g in ((ref_q, got_q), (ref_k, got_k)):
+                        denom = float(torch.linalg.vector_norm(r.float()))
+                        if denom > 0:
+                            worst = max(worst, float(
+                                torch.linalg.vector_norm(g.float() - r.float())
+                            ) / denom)
+                    ok = worst <= _ROPE_PATCH_REL_L2_TOL
+                    if not ok:
+                        reason = (f"rel_l2={worst:.2e} vs the original "
+                                  f"(tol {_ROPE_PATCH_REL_L2_TOL:.0e})")
+                except Exception as e:  # a shape assumption did not hold
+                    ok, got_q, got_k = False, None, None
+                    reason = f"{type(e).__name__}: {e}"
+
+                if not ok:
+                    state["use_kernel"] = False
+                    rejected.append(f"{label}: {reason}")
+                    print(f"  NOTE: kept the model's own {label} -- the optimized "
+                          f"kernel did not reproduce it ({reason}).")
+                    return ref_q, ref_k
+                return got_q, got_k
+
+            return run_kernel(q, k, cos, sin, args, kwargs)
 
         return patched
 
@@ -888,13 +969,21 @@ class OptimizedModelContext:
         if count:
             self._rope_patches.append(patch)
         for name in patch.skipped:
-            self.unapplied.append((
-                repl.kernel_type,
-                f"{name} preprocesses cos/sin (mrope) and is not patched",
-            ))
-            print(f"  NOTE: left {name} alone -- it reshapes cos/sin before "
-                  f"applying them, so swapping it could silently change results.")
+            self.unapplied.append((repl.kernel_type, f"{name} deliberately left alone"))
+            print(f"  NOTE: left {name} alone.")
         return count
+
+    def collect_deferred(self) -> None:
+        """Fold in anything a runtime self-check rejected after installation.
+
+        The RoPE patch can only validate itself once the model actually runs,
+        which is after __enter__ has returned, so its verdict is gathered here.
+        """
+        for patch in self._rope_patches:
+            for reason in patch.rejected:
+                entry = ("rotary_embedding", reason)
+                if entry not in self.unapplied:
+                    self.unapplied.append(entry)
 
     def _replace_rmsnorm_modules(self, repl: KernelReplacement) -> int:
         """
@@ -1511,6 +1600,9 @@ def main() -> None:
             opt_shape_str = str(list(opt_tensor.shape))
             print(f"  Output shape: {opt_shape_str}")
             print(f"  Median latency: {opt_latency:.1f} ms")
+
+            # Runtime self-checks can only report once the model has run.
+            ctx.collect_deferred()
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             print(f"\nERROR: GPU out of memory during optimized run.")
