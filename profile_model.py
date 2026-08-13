@@ -513,6 +513,294 @@ class KernelRecord:
     is_aten: bool = False  # aten:: op (carries shapes) vs. raw CUDA kernel
     roofline: str = ""
     supported: bool = False
+    # For synthesised composites: the aten rows whose time was folded in.
+    composed_of: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# Modules whose forward is a whole AutoKernel op, even though the framework
+# writes it out of primitives. Matched on class name so it works across
+# architectures (LlamaRMSNorm, Qwen2RMSNorm, GemmaRMSNorm, ...) without needing
+# transformers imported.
+_SCOPE_PREFIX = "AKModule::"
+
+_MODULE_OP_TYPES: List[Tuple[str, str]] = [
+    ("rmsnorm", "rmsnorm"),
+    ("rootmeansquarenorm", "rmsnorm"),
+]
+
+
+def _module_op_type(module: nn.Module) -> Optional[str]:
+    """Map a leaf module to the AutoKernel op type its forward implements."""
+    cls = type(module).__name__.lower()
+    if isinstance(module, nn.LayerNorm):
+        return None  # already a single aten op; the op-level pass sees it
+    for needle, op_type in _MODULE_OP_TYPES:
+        if needle in cls:
+            return op_type
+    # Fall back to structure: a leaf "*norm" carrying weight+eps but no bias is
+    # an RMSNorm in all but name.
+    if (cls.endswith("norm") and hasattr(module, "weight")
+            and not getattr(module, "bias", None)
+            and any(hasattr(module, a) for a in ("eps", "variance_epsilon"))):
+        return "rmsnorm"
+    return None
+
+
+class _ModuleScopes:
+    """Wraps selected module forwards in profiler scopes.
+
+    Ops the framework writes out of primitives -- RMSNorm as pow/mean/rsqrt/mul,
+    with an fp32 round trip on top -- carry no name the op-level classifier can
+    recognise, so they never reach the optimization plan. Their *module* is
+    unambiguous, though, so bracketing the forward in a `record_function` lets
+    every op it launched be attributed back to it by walking the event tree.
+
+    This replaces shape-signature pattern matching for module-backed ops: the
+    attribution is exact rather than inferred, it picks up traffic that shape
+    matching cannot safely claim (the fp32 casts), and it needs no new pattern
+    when an architecture spells the same op differently.
+    """
+
+    def __init__(self, model: nn.Module):
+        self.handles: List[Any] = []
+        self.op_types: Dict[str, str] = {}      # class name -> op type
+        self.shapes: Dict[str, List[int]] = {}  # class name -> input shape
+        self._active: Dict[int, Any] = {}
+        self._model = model
+
+    def __enter__(self) -> "_ModuleScopes":
+        for module in self._model.modules():
+            if list(module.children()):
+                continue  # only leaves; a parent would double-count its kids
+            op_type = _module_op_type(module)
+            if op_type is None:
+                continue
+            cls_name = type(module).__name__
+            self.op_types[cls_name] = op_type
+            self.handles.append(module.register_forward_pre_hook(self._pre))
+            self.handles.append(module.register_forward_hook(self._post))
+        return self
+
+    def _pre(self, module: nn.Module, inputs: Tuple[Any, ...]) -> None:
+        cls_name = type(module).__name__
+        if inputs and isinstance(inputs[0], torch.Tensor):
+            self.shapes.setdefault(cls_name, list(inputs[0].shape))
+        scope = torch.profiler.record_function(_SCOPE_PREFIX + cls_name)
+        scope.__enter__()
+        self._active[id(module)] = scope
+
+    def _post(self, module: nn.Module, inputs: Any, output: Any) -> None:
+        scope = self._active.pop(id(module), None)
+        if scope is not None:
+            scope.__exit__(None, None, None)
+
+    def __exit__(self, *exc: Any) -> None:
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+        self._active.clear()
+
+
+def _is_cpu_event(evt: Any) -> bool:
+    """True for dispatcher-timeline events (as opposed to their device twins)."""
+    dev_type = getattr(evt, "device_type", None)
+    if dev_type is None:
+        return True
+    try:
+        from torch.autograd import DeviceType
+
+        return dev_type == DeviceType.CPU
+    except ImportError:
+        return True
+
+
+def _shape_key(evt: Any) -> str:
+    try:
+        return str(evt.input_shapes) if evt.input_shapes else ""
+    except Exception:
+        return ""
+
+
+def _attribute_module_scopes(
+    prof: Any,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[Tuple[str, str], float]]:
+    """Walk the profiler event tree, crediting each op to its enclosing module.
+
+    Returns (per-class totals, time claimed per (op name, shape key)). The
+    second map is what lets the op-level rows be reduced by exactly the time
+    that moved into a module composite, so nothing is counted twice.
+    """
+    totals: Dict[str, Dict[str, Any]] = {}
+    claimed: Dict[Tuple[str, str], float] = {}
+
+    def walk(evt: Any, scope: Optional[str]) -> None:
+        name = getattr(evt, "name", "")
+        if name.startswith(_SCOPE_PREFIX):
+            scope = name[len(_SCOPE_PREFIX):]
+            entry = totals.setdefault(scope, {"gpu_time_us": 0.0, "calls": 0})
+            # The annotation is emitted on both timelines; only the CPU-side
+            # one is the call. Its device-side twin carries no children, so it
+            # would inflate the call count without affecting time.
+            if _is_cpu_event(evt):
+                entry["calls"] += 1
+        elif scope is not None:
+            self_us = getattr(evt, "self_device_time_total", 0.0) or 0.0
+            if self_us > 0:
+                totals[scope]["gpu_time_us"] += self_us
+                key = (name, _shape_key(evt))
+                claimed[key] = claimed.get(key, 0.0) + self_us
+        for child in (getattr(evt, "cpu_children", None) or []):
+            walk(child, scope)
+
+    for evt in prof.events():
+        # Only descend from roots, or subtrees get visited repeatedly.
+        if getattr(evt, "cpu_parent", None) is None:
+            walk(evt, None)
+
+    return totals, claimed
+
+
+def _arg(rec: "KernelRecord", i: int) -> Optional[List[int]]:
+    """Positional arg `i`'s shape, or None if absent/scalar."""
+    if 0 <= i < len(rec.arg_shapes):
+        shape = rec.arg_shapes[i]
+        return shape if shape else None
+    return None
+
+
+def _fuse_composite_ops(records: List["KernelRecord"]) -> List["KernelRecord"]:
+    """Recognise RoPE, which frameworks express as a chain of primitives.
+
+    HuggingFace applies rotary embeddings in a free function
+    (`apply_rotary_pos_emb`, called from inside the attention module) rather
+    than an `nn.Module`, so there is nothing for `_ModuleScopes` to bracket and
+    the op has to be recovered from the ops themselves. Module-backed ops --
+    RMSNorm above all -- are attributed exactly by `_attribute_module_scopes`
+    instead, which is why only RoPE is matched here.
+
+    Members are matched on shape signature, not just op name, so ops that merely
+    share a name (a residual `add`, an unrelated `mul`) are not swept in.
+    Absorbed time is removed from the member rows, so the total is conserved.
+
+    Not absorbed: the `aten::cat` inside `rotate_half`. The profiler records no
+    input shapes for it, so it cannot be pinned to one call site -- RoPE is
+    reported slightly under its true cost as a result.
+    """
+    aten = [r for r in records if r.is_aten]
+    by_name: Dict[str, List[KernelRecord]] = {}
+    for r in aten:
+        by_name.setdefault(r.name, []).append(r)
+
+    # (record -> fraction of its time claimed), accumulated across composites.
+    claimed: Dict[int, float] = {}
+    composites: List[KernelRecord] = []
+
+    def _claim(rec: KernelRecord, frac: float = 1.0) -> None:
+        claimed[id(rec)] = min(1.0, claimed.get(id(rec), 0.0) + frac)
+
+    # --- RoPE: (x * cos) + (rotate_half(x) * sin) -------------------------
+    for mul_rec in by_name.get("aten::mul", []):
+        if id(mul_rec) in claimed:
+            continue
+        x, freq = _arg(mul_rec, 0), _arg(mul_rec, 1)
+        if not x or not freq or len(x) != 4 or len(freq) != 4:
+            continue
+        B, H, S, D = x
+        # cos/sin are [1, 1, S, D]: broadcast across batch and heads.
+        if freq != [1, 1, S, D] or D % 2:
+            continue
+        # rotate_half negates the second half -- corroboration that this is a
+        # rotary embedding and not some other broadcast multiply.
+        negs = [r for r in by_name.get("aten::neg", []) if _arg(r, 0) == [B, H, S, D // 2]]
+        if not negs:
+            continue
+
+        members = [
+            r for r in by_name.get("aten::mul", [])
+            if _arg(r, 0) == x and _arg(r, 1) == freq
+        ]
+        members += negs
+        members += [
+            r for r in by_name.get("aten::add", [])
+            if _arg(r, 0) == x and _arg(r, 1) == x
+        ]
+        members = [m for m in members if id(m) not in claimed]
+        if not members:
+            continue
+        for m in members:
+            _claim(m)
+
+        # `rotate_half` is what the aten::neg above identifies: the negated
+        # slice is half the head dim. The interleaved (GPT-J) convention never
+        # produces it, so this is specifically the split-half variant and must
+        # be tagged as such -- a kernel graded against the interleaved oracle
+        # computes a different rotation and cannot be plugged into the model.
+        composites.append(KernelRecord(
+            name="rotary_embedding_half (fused from %d aten ops)" % len(members),
+            op_type="rotary_embedding_half",
+            gpu_time_us=sum(m.gpu_time_us for m in members),
+            # Two multiplies (cos and sin) per application.
+            call_count=max(1, sum(m.call_count for m in members if m.name == "aten::mul") // 2),
+            input_shapes=f"B={B}, H={H}, N={S}, D={D}",
+            arg_shapes=[],
+            is_aten=True,
+            composed_of=[
+                {"name": m.name, "gpu_time_ms": round(m.gpu_time_us / 1000.0, 3),
+                 "calls": m.call_count, "fraction": 1.0} for m in members
+            ],
+        ))
+
+    if not composites:
+        return records
+
+    # Deduct claimed time from the member rows; drop rows fully absorbed.
+    out: List[KernelRecord] = []
+    for r in records:
+        frac = claimed.get(id(r), 0.0)
+        if frac >= 0.999:
+            continue
+        if frac > 0.0:
+            r.gpu_time_us *= (1.0 - frac)
+            r.call_count = int(round(r.call_count * (1.0 - frac)))
+        out.append(r)
+    return out + composites
+
+
+def _prod_int(dims: List[int]) -> int:
+    n = 1
+    for d in dims:
+        n *= int(d)
+    return n
+
+
+def _is_aten_op(evt: Any, name: str) -> bool:
+    """True if this profiler row is a dispatcher-level op rather than a device kernel.
+
+    ``key_averages()`` returns two populations that both carry device time: the
+    ``aten::`` ops recorded by ProfilerActivity.CPU, and the CUDA kernels those
+    ops launched, recorded by ProfilerActivity.CUDA. Telling them apart by
+    looking for ``"::"`` in the name does not work -- device kernels are C++
+    symbols and carry their own namespaces (``void at::native::elementwise_kernel``,
+    ``pytorch_flash::flash_fwd_kernel``), so they get counted as aten ops, the
+    attribution total is inflated by their time, and they survive into the plan
+    as targets that duplicate a real aten row.
+
+    ``device_type`` is the authoritative signal. The ``"::"`` test is still
+    applied on top of it to drop CPU-side rows that are not ops at all --
+    profiler bookkeeping ("Activity Buffer Request") and CUDA runtime calls
+    ("cudaDeviceSynchronize"), which have device time but no namespace.
+    """
+    dev_type = getattr(evt, "device_type", None)
+    if dev_type is not None:
+        try:
+            from torch.autograd import DeviceType
+
+            return dev_type == DeviceType.CPU and "::" in name
+        except ImportError:
+            pass
+    # Fallback for profiler builds that do not expose device_type: real
+    # dispatcher ops start with a namespace, device symbols start with "void".
+    return name.startswith("aten::")
 
 
 def _run_forward(model: nn.Module, inputs: Dict[str, Any]) -> None:
@@ -564,18 +852,23 @@ def profile_model(
             memory_snapshot = False
 
     # --- Profile ---
-    with torch.no_grad():
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            record_shapes=True,
-            with_stack=False,
-        ) as prof:
-            for _ in range(profile_iters):
-                _run_forward(model, inputs)
-                torch.cuda.synchronize()
+    # Bracket module-backed composite ops (RMSNorm and friends) so their
+    # primitives can be attributed back to the module that launched them.
+    with _ModuleScopes(model) as scopes:
+        with torch.no_grad():
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=False,
+            ) as prof:
+                for _ in range(profile_iters):
+                    _run_forward(model, inputs)
+                    torch.cuda.synchronize()
+
+    module_totals, module_claimed = _attribute_module_scopes(prof)
 
     # --- Export Chrome trace ---
     if export_trace:
@@ -626,7 +919,17 @@ def profile_model(
             continue
 
         name = evt.key
+        if name.startswith(_SCOPE_PREFIX):
+            continue  # our own scope markers, not work
         op_type = classify_kernel(name)
+
+        # Time that ran inside a module composite is reported there instead.
+        moved_us = module_claimed.get((name, _shape_key(evt)), 0.0)
+        if moved_us > 0:
+            remaining = cuda_time_us - moved_us
+            if remaining <= 0.01 * cuda_time_us:
+                continue  # wholly owned by the module
+            cuda_time_us = remaining
 
         # Build shape info -- structured plus a string form for back-compat.
         arg_shapes: List[List[int]] = []
@@ -653,8 +956,31 @@ def profile_model(
             # ProfilerActivity.CPU contributes aten:: op rows; CUDA contributes
             # the device kernels those ops launched. Both carry device time, so
             # the two populations each account for the same physical work.
-            is_aten="::" in name,
+            is_aten=_is_aten_op(evt, name),
         ))
+
+    # Promote each bracketed module to a first-class target, so it competes for
+    # priority against ops that ship as a single op.
+    for cls_name, agg in module_totals.items():
+        op_type = scopes.op_types.get(cls_name)
+        if not op_type or agg["gpu_time_us"] <= 0:
+            continue
+        shape = scopes.shapes.get(cls_name) or []
+        shape_str = ""
+        if len(shape) >= 2:
+            shape_str = f"M={_prod_int(shape[:-1])}, N={int(shape[-1])}"
+        records.append(KernelRecord(
+            name=f"{op_type} ({cls_name} module)",
+            op_type=op_type,
+            gpu_time_us=agg["gpu_time_us"],
+            call_count=agg["calls"],
+            input_shapes=shape_str,
+            arg_shapes=[],
+            is_aten=True,
+        ))
+
+    # RoPE has no module to bracket -- recover it from its ops.
+    records = _fuse_composite_ops(records)
 
     # Sort by GPU time descending
     records.sort(key=lambda r: r.gpu_time_us, reverse=True)
@@ -727,6 +1053,7 @@ def build_report(
             "roofline": r.roofline,
             "autokernel_supported": r.supported,
             "optimization_priority": _priority_label(pct),
+            **({"composed_of": r.composed_of} if r.composed_of else {}),
         })
 
     # Optimization summary
@@ -790,8 +1117,10 @@ def print_report(
     print(f"  Model: {model_desc}")
     print(f"  Input: shape={report['input_shape']}, dtype={report['dtype']}")
     print(f"  GPU:   {report['gpu_name']}")
-    print(f"  Total GPU time: {report['total_gpu_time_ms']:.3f} ms "
-          f"({report['total_kernels']} kernels, {PROFILE_ITERS} iterations)")
+    total_ms = report["total_gpu_time_ms"]
+    print(f"  Total GPU time: {total_ms:.3f} ms "
+          f"({report['total_kernels']} kernels, {PROFILE_ITERS} iterations)"
+          f"  =  {total_ms / PROFILE_ITERS:.2f} ms/iteration")
     print()
 
     # Kernel ranking table
@@ -799,8 +1128,8 @@ def print_report(
     print("  KERNEL RANKING (by GPU time)")
     print("=" * 60)
     header = (
-        f"{'Rank':>4} | {'Op Type':<20} | {'GPU Time (ms)':>13} | "
-        f"{'Calls':>5} | {'Pct':>6} | {'Cumul':>6} | Supported"
+        f"{'Rank':>4} | {'Op Type':<20} | {'Source':<6} | {'GPU Time (ms)':>13} | "
+        f"{'Calls':>5} | {'Pct':>7} | {'Cumul':>6} | Supported"
     )
     print(header)
     print("-" * len(header))
@@ -809,22 +1138,42 @@ def print_report(
     for i in range(display_count):
         k = report["top_kernels"][i]
         sup_label = "YES" if k["autokernel_supported"] else "no"
+        is_device = k["source"] == "device_kernel"
+        # Device-kernel rows re-state work already attributed to an aten row, so
+        # their percentages are not additive. Parenthesise them and leave the
+        # cumulative column blank so the table cannot be read as if 100% of the
+        # model were spread across both populations.
+        pct_cell = (f"({k['pct_total']:.1f}%)" if is_device
+                    else f"{k['pct_total']:.1f}%")
+        cumul_cell = "" if is_device else f"{k['cumulative_pct']:.1f}%"
         print(
             f"{k['rank']:>4} | {k['op_type']:<20} | "
+            f"{'device' if is_device else 'aten':<6} | "
             f"{k['gpu_time_ms']:>13.3f} | "
             f"{k['call_count']:>5} | "
-            f"{k['pct_total']:>5.1f}% | "
-            f"{k['cumulative_pct']:>5.1f}% | "
+            f"{pct_cell:>7} | "
+            f"{cumul_cell:>6} | "
             f"{sup_label}"
         )
 
     remaining = len(records) - display_count
     if remaining > 0:
+        # Only attributable rows contribute to the total, so only they may be
+        # summed into the "remaining" figure.
         remaining_pct = sum(
             report["top_kernels"][i]["pct_total"]
             for i in range(display_count, len(report["top_kernels"]))
+            if report["top_kernels"][i]["source"] == "aten_op"
         )
         print(f"  ... ({remaining} more kernels, {remaining_pct:.1f}% of total)")
+
+    n_device = sum(1 for k in report["top_kernels"] if k["source"] == "device_kernel")
+    if n_device:
+        print()
+        print(f"  ({n_device} 'device' rows are the CUDA kernels the aten ops above "
+              f"launched --")
+        print(f"   shown for reference, and excluded from the total so work is "
+              f"counted once.)")
 
     # Optimization summary
     summary = report["optimization_summary"]

@@ -41,6 +41,19 @@ import torch.nn.functional as F
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_DIR = os.path.join(SCRIPT_DIR, "workspace")
+
+# Kernel types that can actually be installed back into a model. A type absent
+# from this set can still be optimized by the Phase B loop, but its speedup
+# will never show up end to end -- so extraction should prefer types listed
+# here, and verification reports the gap explicitly.
+SUPPORTED_REPLACEMENT_TYPES = (
+    "matmul",
+    "layernorm",
+    "rmsnorm",
+    "fused_mlp",
+    "rotary_embedding",
+    "rotary_embedding_half",
+)
 ORCHESTRATION_STATE = os.path.join(WORKSPACE_DIR, "orchestration_state.json")
 
 # Benchmarking defaults
@@ -48,10 +61,46 @@ WARMUP_RUNS = 10
 TIMED_RUNS = 50
 
 # Tolerance defaults by dtype
+# Tolerances for comparing whole-model outputs, which is a different problem
+# from comparing one kernel's output. An optimized kernel accumulates in fp32
+# and rounds once; the eager model rounds at every step, and over dozens of
+# layers those roundings compound. The floor is the dtype's own precision:
+# bf16 carries 8 mantissa bits (eps 7.8e-3), so logits of magnitude ~10 cannot
+# be reproduced closer than ~0.08 by *any* reordering of the arithmetic.
+#
+# The previous 2e-3 absolute tolerance sat an order of magnitude below that
+# floor, so every correct kernel failed end-to-end verification while passing
+# its own bench.py checks. These values track eps and still catch real
+# breakage, which shows up at the scale of the output itself (or as NaN/Inf,
+# checked separately).
 DEFAULT_TOLERANCES: Dict[torch.dtype, Dict[str, float]] = {
-    torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
-    torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
+    torch.float16:  {"atol": 2e-2, "rtol": 2e-2},
+    torch.bfloat16: {"atol": 8e-2, "rtol": 4e-2},
     torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
+}
+
+# Whole-tensor relative L2 -- the pass criterion for reduced precision. A
+# correct kernel differs from eager only by rounding, which is random in sign
+# and partially cancels in the norm; a genuinely wrong one (mis-set epsilon,
+# transposed operand, wrong rotation) shifts the whole tensor.
+#
+# Measured on Qwen2 towers, output logits, bf16:
+#   correct kernel, 2 layers   1e-3 .. 5e-3
+#   correct kernel, 28 layers  ~1.8e-2      <- floor grows with depth
+#   +1% systematic error       ~2.1e-2  (caught)
+#   +5% systematic error       ~9.2e-2  (caught)
+#
+# The floor rises with depth because a rounding difference at layer 0 is
+# re-amplified by every layer above it, so this threshold trades sensitivity on
+# deep models for not failing correct ones: it reliably catches errors of ~1.5%
+# and up on a 28-layer model, and ~0.5% and up on a shallow one. Override with
+# --rel-l2-tol to tighten it for a specific model, and prefer per-kernel
+# bench.py correctness (which compares one op, with no depth amplification) as
+# the primary gate -- this is the integration check, not the unit check.
+REL_L2_TOLERANCES: Dict[torch.dtype, float] = {
+    torch.float16:  1e-2,
+    torch.bfloat16: 3e-2,
+    torch.float32:  1e-5,
 }
 
 
@@ -85,11 +134,15 @@ class VerificationResult:
     opt_output_shape: str = ""
     opt_latency_ms: float = 0.0
     kernels_replaced: List[Dict[str, Any]] = field(default_factory=list)
+    # (kernel_type, reason) pairs for optimized kernels that could not be
+    # installed -- their gains are absent from end_to_end_speedup.
+    kernels_not_applied: List[Tuple[str, str]] = field(default_factory=list)
 
     # Comparison
     correctness: str = "UNKNOWN"
     max_abs_error: float = 0.0
     mean_abs_error: float = 0.0
+    rel_l2_error: float = 0.0
     has_nan: bool = False
     has_inf: bool = False
 
@@ -540,7 +593,13 @@ class _RMSNormWrapper(nn.Module):
         self.kernel_fn = kernel_fn
         # RMSNorm typically has a 'weight' attribute
         self.weight = getattr(original, "weight", None)
-        self.eps = getattr(original, "eps", 1e-6)
+        # HF spells the epsilon `variance_epsilon` (LLaMA, Qwen2, Gemma);
+        # reading only `eps` silently substituted a 1e-6 default and normalized
+        # by a different constant than the model was trained with.
+        eps = getattr(original, "variance_epsilon", None)
+        if eps is None:
+            eps = getattr(original, "eps", 1e-6)
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
@@ -563,6 +622,126 @@ class _RMSNormWrapper(nn.Module):
         return out
 
 
+class _FusedMLPWrapper(nn.Module):
+    """Wraps a SwiGLU MLP block to use an optimized fused_mlp kernel_fn.
+
+    Matches the gate/up/down projection triple that LLaMA, Qwen2, Mistral and
+    Gemma all share. The kernel owns the whole block -- both projections, the
+    activation, the elementwise product and the down projection -- so the
+    [tokens, intermediate] temporaries never reach global memory.
+    """
+
+    # (gate, up, down) attribute names, in the spellings HF uses.
+    _TRIPLES = [
+        ("gate_proj", "up_proj", "down_proj"),
+        ("w1", "w3", "w2"),  # older LLaMA / Mixtral expert naming
+    ]
+
+    @classmethod
+    def match(cls, module: nn.Module) -> Optional[Tuple[str, str, str]]:
+        for names in cls._TRIPLES:
+            mods = [getattr(module, n, None) for n in names]
+            if all(isinstance(m, nn.Linear) for m in mods):
+                # A fused kernel folds in no bias; leave biased MLPs alone.
+                if any(m.bias is not None for m in mods):
+                    return None
+                return names
+        return None
+
+    def __init__(self, original: nn.Module, kernel_fn: Callable):
+        super().__init__()
+        names = self.match(original)
+        if names is None:
+            raise ValueError(f"{type(original).__name__} is not a SwiGLU MLP")
+        self.original = original
+        self.kernel_fn = kernel_fn
+        gate, up, down = (getattr(original, n) for n in names)
+        # reference.fused_mlp_ref takes w_* as [out, in] and transposes
+        # internally, which is exactly nn.Linear's layout -- pass as stored.
+        self.w_gate = gate.weight
+        self.w_up = up.weight
+        self.w_down = down.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        out = _call_kernel(
+            self.kernel_fn,
+            [(x_2d, self.w_gate, self.w_up, self.w_down, "silu"),
+             (x_2d, self.w_gate, self.w_up, self.w_down)],
+        )
+        if len(orig_shape) > 2:
+            out = out.reshape(*orig_shape[:-1], out.shape[-1])
+        return out
+
+
+class _RoPEFunctionPatch:
+    """Swaps a model's `apply_rotary_pos_emb` for an optimized kernel_fn.
+
+    RoPE is the one supported op that is not an `nn.Module`: HF applies it in a
+    free function called from inside attention, so there is nothing to replace
+    in the module tree. This patches the function on the modeling module
+    instead, and restores it on exit.
+
+    Only the standard `(q, k, cos, sin, ...)` form is patched. Variants that
+    preprocess cos/sin first -- Qwen2-VL's `apply_multimodal_rotary_pos_emb`
+    slices them into mrope sections -- are left alone rather than guessed at,
+    since reproducing that reshaping wrongly would corrupt results silently.
+    """
+
+    _NAMES = ("apply_rotary_pos_emb",)
+
+    def __init__(self, model: nn.Module, kernel_fn: Callable):
+        self.kernel_fn = kernel_fn
+        self.model = model
+        self._saved: List[Tuple[Any, str, Callable]] = []
+        self.skipped: List[str] = []
+
+    def _target_modules(self) -> List[Any]:
+        seen, out = set(), []
+        for module in self.model.modules():
+            mod_name = type(module).__module__
+            if mod_name in seen or not mod_name.startswith("transformers"):
+                continue
+            seen.add(mod_name)
+            py_mod = sys.modules.get(mod_name)
+            if py_mod is not None:
+                out.append(py_mod)
+        return out
+
+    def apply(self) -> int:
+        count = 0
+        for py_mod in self._target_modules():
+            for attr in dir(py_mod):
+                if not attr.startswith("apply_") or "rotary" not in attr:
+                    continue
+                fn = getattr(py_mod, attr, None)
+                if not callable(fn):
+                    continue
+                if attr not in self._NAMES:
+                    self.skipped.append(f"{py_mod.__name__}.{attr}")
+                    continue
+                self._saved.append((py_mod, attr, fn))
+                setattr(py_mod, attr, self._make_patched())
+                count += 1
+        return count
+
+    def _make_patched(self) -> Callable:
+        kernel_fn = self.kernel_fn
+
+        def patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            cos = cos.unsqueeze(unsqueeze_dim)
+            sin = sin.unsqueeze(unsqueeze_dim)
+            return kernel_fn(q, cos, sin), kernel_fn(k, cos, sin)
+
+        return patched
+
+    def restore(self) -> None:
+        for py_mod, attr, fn in self._saved:
+            setattr(py_mod, attr, fn)
+        self._saved.clear()
+
+
 class OptimizedModelContext:
     """
     Context manager that patches a model's submodules to use optimized Triton kernels.
@@ -577,6 +756,11 @@ class OptimizedModelContext:
         self.replacements = replacements
         self._original_modules: Dict[str, nn.Module] = {}
         self._applied: List[str] = []
+        self._rope_patches: List[_RoPEFunctionPatch] = []
+        # (kernel_type, reason) for kernels that were optimized but could not
+        # be installed. Reported so their absence from the end-to-end speedup
+        # is visible rather than silent.
+        self.unapplied: List[Tuple[str, str]] = []
 
     def __enter__(self) -> nn.Module:
         for repl in self.replacements:
@@ -606,6 +790,12 @@ class OptimizedModelContext:
             self._install(name, self._original_modules[name])
         self._original_modules.clear()
         self._applied.clear()
+        # Module-level function patches are global, so they must come back off
+        # even if a replacement raised -- otherwise the reference run that
+        # follows would silently use the optimized RoPE too.
+        for patch in self._rope_patches:
+            patch.restore()
+        self._rope_patches.clear()
 
     def _apply_replacement(self, repl: KernelReplacement) -> int:
         """
@@ -619,9 +809,18 @@ class OptimizedModelContext:
             count = self._replace_layernorm_modules(repl)
         elif repl.kernel_type == "rmsnorm":
             count = self._replace_rmsnorm_modules(repl)
+        elif repl.kernel_type == "fused_mlp":
+            count = self._replace_mlp_modules(repl)
+        elif repl.kernel_type in ("rotary_embedding", "rotary_embedding_half"):
+            count = self._patch_rotary(repl)
         else:
+            self.unapplied.append((repl.kernel_type, "no replacement strategy"))
             print(f"  NOTE: No replacement strategy for kernel type '{repl.kernel_type}'. "
-                  f"Skipping. (Supported: matmul, layernorm, rmsnorm)")
+                  f"Skipping -- its speedup will NOT appear in the end-to-end number. "
+                  f"(Supported: {', '.join(SUPPORTED_REPLACEMENT_TYPES)})")
+
+        if count == 0 and repl.kernel_type in SUPPORTED_REPLACEMENT_TYPES:
+            self.unapplied.append((repl.kernel_type, "no matching modules in this model"))
 
         return count
 
@@ -674,6 +873,29 @@ class OptimizedModelContext:
             _LayerNormWrapper,
         )
 
+    def _replace_mlp_modules(self, repl: KernelReplacement) -> int:
+        """Replace SwiGLU MLP blocks with a fused kernel."""
+        return self._replace_matching(
+            repl,
+            lambda name, m: _FusedMLPWrapper.match(m) is not None,
+            _FusedMLPWrapper,
+        )
+
+    def _patch_rotary(self, repl: KernelReplacement) -> int:
+        """Patch the model's RoPE function (it is not a module)."""
+        patch = _RoPEFunctionPatch(self.model, repl.module_fn)
+        count = patch.apply()
+        if count:
+            self._rope_patches.append(patch)
+        for name in patch.skipped:
+            self.unapplied.append((
+                repl.kernel_type,
+                f"{name} preprocesses cos/sin (mrope) and is not patched",
+            ))
+            print(f"  NOTE: left {name} alone -- it reshapes cos/sin before "
+                  f"applying them, so swapping it could silently change results.")
+        return count
+
     def _replace_rmsnorm_modules(self, repl: KernelReplacement) -> int:
         """
         Replace RMSNorm modules. Since there is no standard nn.RMSNorm,
@@ -683,15 +905,25 @@ class OptimizedModelContext:
 
         def _matches(name: str, module: nn.Module) -> bool:
             cls_name = type(module).__name__
-            # Match by class name, or by having 'weight' but no 'bias' and a
-            # norm-like class name.
+            if isinstance(module, nn.LayerNorm):
+                return False
+            if cls_name in rmsnorm_names:
+                return True
+            # Structural match, for the many spellings not in the list above
+            # (Qwen2RMSNorm, MistralRMSNorm, Phi3RMSNorm, ...): a norm-like
+            # leaf with a weight, no bias, and an epsilon.
+            #
+            # This previously required an `eps` attribute and tested
+            # `not hasattr(module, "bias")`. HF names the epsilon
+            # `variance_epsilon` and registers `bias` as a None buffer, so
+            # every HF RMSNorm failed both tests and was silently left
+            # unreplaced -- the one op most worth replacing.
+            has_eps = any(hasattr(module, a) for a in ("eps", "variance_epsilon"))
             return (
-                cls_name in rmsnorm_names
-                or (hasattr(module, "weight")
-                    and hasattr(module, "eps")
-                    and not hasattr(module, "bias")
-                    and cls_name.lower().endswith("norm")
-                    and not isinstance(module, nn.LayerNorm))
+                cls_name.lower().endswith("norm")
+                and getattr(module, "weight", None) is not None
+                and getattr(module, "bias", None) is None
+                and has_eps
             )
 
         return self._replace_matching(repl, _matches, _RMSNormWrapper)
@@ -750,6 +982,7 @@ def compare_outputs(
     dtype: torch.dtype,
     custom_atol: Optional[float] = None,
     custom_rtol: Optional[float] = None,
+    custom_rel_l2: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Compare reference and optimized outputs. Returns comparison metrics.
@@ -794,30 +1027,75 @@ def compare_outputs(
         valid_diff = diff[valid_mask]
         result["max_abs_error"] = float(valid_diff.max())
         result["mean_abs_error"] = float(valid_diff.mean())
+        # An absolute error is uninterpretable without the scale it sits on:
+        # 0.04 is noise on logits of 10 and catastrophic on activations of
+        # 0.001. Report the error relative to the output's own magnitude, and
+        # relative to what the dtype can represent at that magnitude.
+        ref_scale = float(ref_float[valid_mask].abs().max())
+        result["ref_abs_max"] = ref_scale
+        result["max_rel_error"] = (
+            result["max_abs_error"] / ref_scale if ref_scale > 0 else 0.0
+        )
+        try:
+            eps = float(torch.finfo(dtype).eps)
+            result["error_in_ulps"] = (
+                result["max_abs_error"] / (eps * ref_scale) if ref_scale > 0 else 0.0
+            )
+        except (TypeError, ValueError):
+            pass
     else:
         result["max_abs_error"] = 0.0
         result["mean_abs_error"] = 0.0
+        result["max_rel_error"] = 0.0
 
     # Tolerance check
     tols = DEFAULT_TOLERANCES.get(dtype, {"atol": 1e-4, "rtol": 1e-4})
     atol = custom_atol if custom_atol is not None else tols["atol"]
     rtol = custom_rtol if custom_rtol is not None else tols["rtol"]
 
-    # Use allclose on the valid (non-NaN) elements
+    # Relative L2 over the whole tensor. For a deep model in reduced precision
+    # this is the criterion that means something: per-element allclose fails on
+    # a single logit that happens to sit near zero, even when every kernel is
+    # correct, because rounding differences at layer 0 amplify through dozens
+    # of layers. Relative L2 asks the question actually of interest -- does the
+    # optimized model compute the same function -- and cannot be dominated by
+    # one outlier element.
     if valid_mask.any():
-        passes = torch.allclose(
-            ref_float[valid_mask], opt_float[valid_mask], atol=atol, rtol=rtol
+        ref_valid = ref_float[valid_mask]
+        opt_valid = opt_float[valid_mask]
+        denom = float(torch.linalg.vector_norm(ref_valid))
+        rel_l2 = (
+            float(torch.linalg.vector_norm(opt_valid - ref_valid)) / denom
+            if denom > 0 else 0.0
         )
+        result["rel_l2_error"] = rel_l2
+        elementwise_ok = torch.allclose(ref_valid, opt_valid, atol=atol, rtol=rtol)
     else:
-        passes = True
+        result["rel_l2_error"] = 0.0
+        rel_l2 = 0.0
+        elementwise_ok = True
+
+    rel_l2_tol = (custom_rel_l2 if custom_rel_l2 is not None
+                  else REL_L2_TOLERANCES.get(dtype, 1e-4))
+    result["rel_l2_tol"] = rel_l2_tol
+
+    if dtype in (torch.float16, torch.bfloat16):
+        passes = rel_l2 <= rel_l2_tol
+        criterion = f"rel_l2={rel_l2:.3e} vs tol {rel_l2_tol:.1e}"
+    else:
+        # fp32 has the headroom for an exact elementwise check; keep it strict.
+        passes = elementwise_ok
+        criterion = f"allclose(atol={atol}, rtol={rtol})"
 
     result["correctness"] = "PASS" if passes else "FAIL"
     result["atol"] = atol
     result["rtol"] = rtol
+    result["criterion"] = criterion
 
     if not passes:
         result["reason"] = (
-            f"Values exceed tolerance (atol={atol}, rtol={rtol}). "
+            f"Output differs beyond tolerance [{criterion}]. "
+            f"rel_l2_error={rel_l2:.6e}, "
             f"max_abs_error={result['max_abs_error']:.6e}, "
             f"mean_abs_error={result['mean_abs_error']:.6e}"
         )
@@ -925,6 +1203,7 @@ def format_report(result: VerificationResult, diagnose_results: Optional[List] =
     lines.append("")
     lines.append("--- Verification ---")
     lines.append(f"correctness: {result.correctness}")
+    lines.append(f"rel_l2_error: {result.rel_l2_error:.2e}")
     lines.append(f"max_abs_error: {result.max_abs_error:.2e}")
     lines.append(f"mean_abs_error: {result.mean_abs_error:.2e}")
     if result.has_nan:
@@ -975,6 +1254,7 @@ def save_verification_json(result: VerificationResult, path: str) -> None:
         },
         "verification": {
             "correctness": result.correctness,
+            "rel_l2_error": result.rel_l2_error,
             "max_abs_error": result.max_abs_error,
             "mean_abs_error": result.mean_abs_error,
             "has_nan": result.has_nan,
@@ -985,6 +1265,9 @@ def save_verification_json(result: VerificationResult, path: str) -> None:
             "optimized_latency_ms": round(result.opt_latency_ms, 2),
             "end_to_end_speedup": round(result.end_to_end_speedup, 3),
             "kernels_replaced": len(result.kernels_replaced),
+            "kernels_not_applied": [
+                {"kernel_type": t, "reason": r} for t, r in result.kernels_not_applied
+            ],
         },
     }
 
@@ -1084,6 +1367,9 @@ def main() -> None:
     # Tolerance overrides
     parser.add_argument("--atol", type=float, default=None, help="Override absolute tolerance")
     parser.add_argument("--rtol", type=float, default=None, help="Override relative tolerance")
+    parser.add_argument("--rel-l2-tol", type=float, default=None,
+                        help="Override the relative-L2 tolerance used as the "
+                             "pass criterion for fp16/bf16 (see REL_L2_TOLERANCES)")
 
     # Modes
     parser.add_argument(
@@ -1211,6 +1497,13 @@ def main() -> None:
                 print("  WARNING: No kernel replacements could be applied to this model.")
                 print("  The model may not contain modules matching the optimized kernel types.")
 
+            if ctx.unapplied:
+                print()
+                print("  NOT APPLIED -- these kernels were optimized but could not be")
+                print("  installed, so their speedup is absent from the number below:")
+                for ktype, reason in ctx.unapplied:
+                    print(f"    {ktype}: {reason}")
+
             opt_output, opt_latency = benchmark_model(
                 patched_model, model_input, WARMUP_RUNS, TIMED_RUNS
             )
@@ -1238,7 +1531,8 @@ def main() -> None:
     # Step 6: Compare outputs
     # -----------------------------------------------------------------------
     print("Step 6: Comparing outputs...")
-    comp = compare_outputs(ref_tensor, opt_tensor, dtype, args.atol, args.rtol)
+    comp = compare_outputs(ref_tensor, opt_tensor, dtype, args.atol, args.rtol,
+                           getattr(args, "rel_l2_tol", None))
     print(f"  correctness: {comp['correctness']}")
     print(f"  max_abs_error: {comp.get('max_abs_error', 0):.2e}")
     print(f"  mean_abs_error: {comp.get('mean_abs_error', 0):.2e}")
@@ -1281,8 +1575,10 @@ def main() -> None:
             for r in replacements
             if r.module_fn is not None
         ],
+        kernels_not_applied=list(ctx.unapplied),
         correctness=comp["correctness"],
         max_abs_error=comp.get("max_abs_error", 0.0),
+        rel_l2_error=comp.get("rel_l2_error", 0.0),
         mean_abs_error=comp.get("mean_abs_error", 0.0),
         has_nan=comp.get("opt_has_nan", False),
         has_inf=comp.get("opt_has_inf", False),

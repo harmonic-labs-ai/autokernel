@@ -58,7 +58,8 @@ def main() -> int:
     valid_n = {hidden, inter, vocab, kv_dim}
 
     with open(args.report) as f:
-        rows = json.load(f)["top_kernels"]
+        report = json.load(f)
+    rows = report["top_kernels"]
     sup = [r for r in rows if r.get("autokernel_supported")]
 
     resolved = []
@@ -148,6 +149,66 @@ def main() -> int:
         check(key not in seen,
               f"ranks {seen.get(key)} and {e['rank']} share a shape after dedup")
         seen[key] = e["rank"]
+
+    # 7. RMSNorm and RoPE reach the plan at all. HF writes both as a chain of
+    #    primitives, so a name-only classifier drops them -- and they are the
+    #    largest memory-bound targets in a Qwen2 tower.
+    by_type = {e["op_type"] for e in kept}
+    check("rmsnorm" in by_type,
+          "no rmsnorm target -- module-scope attribution did not fire")
+    # HF LLaMA/Qwen2 rotate half the head dim; a kernel graded against the
+    # interleaved oracle would compute a different rotation, so the plan must
+    # name the split-half variant specifically.
+    check("rotary_embedding_half" in by_type,
+          "no rotary_embedding_half target -- the RoPE detector did not fire")
+    check("rotary_embedding" not in by_type,
+          "RoPE was tagged as the interleaved convention, but this model "
+          "rotates half the head dim")
+
+    # 8. ...and normalise over the hidden dim, rotating the real head geometry.
+    for e in kept:
+        s = e["model_shape"]
+        if e["op_type"] == "rmsnorm":
+            check(s.get("N") == hidden,
+                  f"rank {e['rank']} rmsnorm N={s.get('N')}, expected {hidden}")
+            check(s.get("M") == args.seq,
+                  f"rank {e['rank']} rmsnorm M={s.get('M')}, expected {args.seq}")
+        elif e["op_type"].startswith("rotary_embedding"):
+            check(s.get("heads") in (heads, kv_heads),
+                  f"rank {e['rank']} rope heads={s.get('heads')}, "
+                  f"expected {heads} or {kv_heads}")
+            check(s.get("seq_len") == args.seq,
+                  f"rank {e['rank']} rope seq_len={s.get('seq_len')}, "
+                  f"expected {args.seq}")
+            check(s.get("head_dim") == head_dim,
+                  f"rank {e['rank']} rope head_dim={s.get('head_dim')}, "
+                  f"expected {head_dim}")
+
+    # 9. The aten rows and the device kernels they launched are two independent
+    #    measures of the same physical work, so their totals must agree. They
+    #    diverge when device kernels leak into the aten population (inflating
+    #    the total and creating phantom targets), or when folding a decomposed
+    #    op into a composite double-counts or drops its members.
+    aten_ms = sum(r["gpu_time_ms"] for r in rows if r.get("source") == "aten_op")
+    dev_ms = sum(r["gpu_time_ms"] for r in rows if r.get("source") == "device_kernel")
+    if dev_ms > 0:
+        skew = abs(aten_ms - dev_ms) / dev_ms
+        check(skew < 0.05,
+              f"aten total {aten_ms:.1f} ms vs device total {dev_ms:.1f} ms "
+              f"({skew:.1%} apart) -- work is being counted twice or lost")
+        print(f"\naten {aten_ms:.2f} ms vs device {dev_ms:.2f} ms "
+              f"({skew:.2%} apart) -- same work, counted once")
+
+    # 10. Every composite must equal the sum of the parts it absorbed.
+    for r in rows:
+        parts = r.get("composed_of")
+        if not parts:
+            continue
+        want = sum(p["gpu_time_ms"] for p in parts)
+        got = r["gpu_time_ms"]
+        check(abs(got - want) <= 0.01 * max(want, 1e-9),
+              f"rank {r['rank']} {r['op_type']} is {got:.3f} ms but its "
+              f"{len(parts)} parts sum to {want:.3f} ms")
 
     if failures:
         print(f"\nFAILED ({len(failures)}):")

@@ -59,7 +59,9 @@ def cross_entropy_ref(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tens
     """Standard cross entropy loss."""
     return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-# Rotary Position Embedding
+# Rotary Position Embedding -- interleaved ("GPT-J") convention.
+# Pairs are adjacent elements (0,1), (2,3), ...; cos/sin span head_dim // 2.
+# Used by GPT-J, ChatGLM and the original RoPE paper.
 def rotary_embedding_ref(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Apply rotary position embeddings."""
     x1 = x[..., ::2]
@@ -67,6 +69,19 @@ def rotary_embedding_ref(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) 
     rx1 = x1 * cos - x2 * sin
     rx2 = x1 * sin + x2 * cos
     return torch.stack([rx1, rx2], dim=-1).flatten(-2)
+
+# Rotary Position Embedding -- split-half ("rotate_half" / NeoX) convention.
+# Pairs are i and i + head_dim//2; cos/sin span the full head_dim, each angle
+# duplicated across the two halves. This is what HuggingFace LLaMA, Qwen2/2.5,
+# Mistral and Gemma use, so it is the convention a kernel must implement to be
+# plugged back into one of those models. The two are NOT interchangeable: they
+# rotate different pairs of elements and give different results.
+def rotary_embedding_half_ref(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary position embeddings, rotate_half convention."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return x * cos + rotated * sin
 
 # Parallel Reductions
 def reduce_sum_ref(x: torch.Tensor, dim: int = -1) -> torch.Tensor:

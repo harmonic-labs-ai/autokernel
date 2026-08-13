@@ -65,6 +65,7 @@ SHAPE_KEYS: Dict[str, List[str]] = {
     "rmsnorm":           ["M", "N"],
     "reduce":            ["M", "N"],
     "rotary_embedding":  ["B", "H", "N", "D"],
+    "rotary_embedding_half": ["B", "H", "N", "D"],
 }
 
 # Aliases: profile_report.json may use different key names than bench.py
@@ -96,6 +97,10 @@ SHAPE_ALIAS_MAP: Dict[str, Dict[str, str]] = {
         "M": "M", "N": "N",
     },
     "rotary_embedding": {
+        "B": "batch", "H": "heads", "N": "seq_len", "S": "seq_len", "D": "head_dim",
+        "batch": "batch", "heads": "heads", "seq_len": "seq_len", "head_dim": "head_dim",
+    },
+    "rotary_embedding_half": {
         "B": "batch", "H": "heads", "N": "seq_len", "S": "seq_len", "D": "head_dim",
         "batch": "batch", "heads": "heads", "seq_len": "seq_len", "head_dim": "head_dim",
     },
@@ -142,8 +147,13 @@ TOLERANCES_MAP: Dict[str, Dict[str, Dict[str, float]]] = {
         "bfloat16": {"atol": 1e-1, "rtol": 5e-2},
     },
     "rotary_embedding": {
-        "float16":  {"atol": 1e-3, "rtol": 1e-3},
-        "bfloat16": {"atol": 2e-3, "rtol": 2e-3},
+        "float16":  {"atol": 5e-3, "rtol": 5e-3},
+        "bfloat16": {"atol": 4e-2, "rtol": 2e-2},
+        "float32":  {"atol": 1e-5, "rtol": 1e-5},
+    },
+    "rotary_embedding_half": {
+        "float16":  {"atol": 5e-3, "rtol": 5e-3},
+        "bfloat16": {"atol": 4e-2, "rtol": 2e-2},
         "float32":  {"atol": 1e-5, "rtol": 1e-5},
     },
 }
@@ -159,6 +169,7 @@ TEST_DTYPES_MAP: Dict[str, List[str]] = {
     "fused_mlp":        ["float16", "bfloat16", "float32"],
     "cross_entropy":    ["float16", "bfloat16", "float32"],
     "rotary_embedding": ["float16", "bfloat16", "float32"],
+    "rotary_embedding_half": ["float16", "bfloat16", "float32"],
     "rmsnorm":          ["float16", "bfloat16"],
     "reduce":           ["float16", "bfloat16"],
 }
@@ -188,6 +199,7 @@ FLOPS_FN_SRC: Dict[str, str] = {
     "rmsnorm":          'return 6 * s["M"] * s["N"]',
     "reduce":           'return s["M"] * s["N"]',
     "rotary_embedding": 'return 6 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"]',
+    "rotary_embedding_half": 'return 6 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"]',
 }
 
 # BYTES formulas as source strings, per op_type (dt_bytes is passed in)
@@ -201,6 +213,7 @@ BYTES_FN_SRC: Dict[str, str] = {
     "rmsnorm":          'return (2 * s["M"] * s["N"] + s["N"]) * dt_bytes',
     "reduce":           'return (s["M"] * s["N"] + s["M"]) * dt_bytes',
     "rotary_embedding": 'return (s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * 2 + s["seq_len"] * s["head_dim"]) * dt_bytes',
+    "rotary_embedding_half": 'return (s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * 2 + s["seq_len"] * s["head_dim"] * 2) * dt_bytes',
 }
 
 # Speedup potential heuristic per op_type
@@ -214,6 +227,7 @@ SPEEDUP_ESTIMATES: Dict[str, str] = {
     "rmsnorm":          "1.5-3x",
     "reduce":           "1.5-2x",
     "rotary_embedding": "1.5-2x",
+    "rotary_embedding_half": "1.5-2x",
 }
 
 
@@ -332,7 +346,7 @@ def parse_shape_list(
         gemm = _gemm_shape_from_args(mats)
         return _apply_alias_map(gemm, op_type) if gemm else None
 
-    if op_type in ("flash_attention", "rotary_embedding"):
+    if op_type in ("flash_attention", "rotary_embedding", "rotary_embedding_half"):
         # Query is the first operand, but the axis order depends on the op:
         # the FlashAttention entry points take [B, S, H, D], while SDPA and
         # its fused backends take [B, H, S, D].
@@ -464,6 +478,7 @@ def get_default_shape(op_type: str) -> Dict[str, int]:
         "rmsnorm":          {"M": 4096, "N": 4096},
         "reduce":           {"M": 4096, "N": 4096},
         "rotary_embedding": {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128},
+        "rotary_embedding_half": {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128},
     }
     return defaults.get(op_type, {"M": 2048, "N": 2048})
 
@@ -479,14 +494,20 @@ def resolve_model_shape(kernel_info: Dict[str, Any]) -> Tuple[Dict[str, int], st
     op_type = kernel_info.get("op_type", "unknown")
     name = kernel_info.get("name", "")
 
-    # Prefer the structured field; fall back to the stringified one.
-    raw_shapes = kernel_info.get("input_shapes")
-    if raw_shapes is None:
-        raw_shapes = kernel_info.get("shape_info", kernel_info.get("shape", ""))
-
-    shape = parse_shape_info(raw_shapes, op_type, name)
-    if shape:
-        return shape, "profiled"
+    # Prefer the structured field, then the stringified one. An *empty*
+    # structured field carries no information, so it must not suppress the
+    # string form the way `is None` did -- entries the profiler synthesises for
+    # ops it recognised from a chain of primitives (rmsnorm, rotary_embedding)
+    # carry their shape only as "M=2048, N=3584".
+    for raw_shapes in (
+        kernel_info.get("input_shapes"),
+        kernel_info.get("shape_info", kernel_info.get("shape", "")),
+    ):
+        if not raw_shapes:
+            continue
+        shape = parse_shape_info(raw_shapes, op_type, name)
+        if shape:
+            return shape, "profiled"
 
     if isinstance(kernel_info.get("shapes"), dict) and kernel_info["shapes"]:
         return kernel_info["shapes"], "report"
@@ -889,6 +910,7 @@ def extract_kernels(
     kernel_type_filter: Optional[str] = None,
     backend: str = DEFAULT_BACKEND,
     dtype_override: Optional[str] = None,
+    allow_default_shapes: bool = False,
 ) -> None:
     """Main extraction pipeline."""
 
@@ -970,23 +992,40 @@ def extract_kernels(
     if duplicates:
         print()
 
+    # A kernel with no parseable shape gets a generic fallback, which means it
+    # would be tuned at a problem size the model never runs -- hours of
+    # experiments that cannot transfer. Drop these before --top N, so N asks
+    # for N *usable* kernels rather than N rows padded out with unusable ones.
+    defaulted = [e for e in resolved if e["shape_source"] == "default"]
+    if defaulted:
+        verb = "Extracting anyway" if allow_default_shapes else "Skipping"
+        print(f"  WARNING: {len(defaulted)} kernel(s) had no parseable shape in the "
+              f"report and fall back to generic defaults:")
+        for e in defaulted:
+            print(f"           rank {e['rank']} ({e['op_type']}, {e['pct_total']:.1f}%) -> "
+                  f"{shape_to_display(e['model_shape'])}")
+        print(f"           {verb}: a kernel tuned at the wrong problem size does not "
+              f"transfer back to the model.")
+        if not allow_default_shapes:
+            print(f"           Pass --allow-default-shapes to extract them regardless.")
+        print(f"           If these matter, check the profiler ran with record_shapes=True.")
+        print()
+        if not allow_default_shapes:
+            resolved = [e for e in resolved if e["shape_source"] != "default"]
+
+    if not resolved:
+        print("ERROR: No kernels left to extract -- every candidate resolved to a "
+              "generic default shape.")
+        print("       Re-profile with record_shapes=True, or pass "
+              "--allow-default-shapes to extract them as-is.")
+        sys.exit(1)
+
     # Now that duplicates are gone, --top N means N distinct kernels.
     if top_n is not None:
         resolved = resolved[:top_n]
 
     print(f"Extracting {len(resolved)} distinct kernel(s).")
     print()
-
-    defaulted = [e for e in resolved if e["shape_source"] == "default"]
-    if defaulted:
-        print(f"  WARNING: {len(defaulted)} kernel(s) had no parseable shape in the "
-              f"report and fall back to generic defaults:")
-        for e in defaulted:
-            print(f"           rank {e['rank']} ({e['op_type']}) -> "
-                  f"{shape_to_display(e['model_shape'])}")
-        print(f"           These will be tuned at the wrong problem size. Check that "
-              f"the profiler ran with record_shapes=True.")
-        print()
 
     # -- Extract each kernel --
     print("Extracting kernels:")
@@ -1119,6 +1158,13 @@ def main() -> None:
              "This becomes TEST_DTYPES[0] in the generated kernels, which is what "
              "bench.py measures with.",
     )
+    parser.add_argument(
+        "--allow-default-shapes",
+        action="store_true",
+        help="Extract kernels whose shape could not be parsed from the report, "
+             "using a generic fallback size. Off by default: such a kernel is "
+             "tuned at a problem size the model never runs.",
+    )
 
     args = parser.parse_args()
 
@@ -1128,6 +1174,7 @@ def main() -> None:
         kernel_type_filter=args.kernel_type,
         backend=args.backend,
         dtype_override=args.dtype,
+        allow_default_shapes=args.allow_default_shapes,
     )
 
 

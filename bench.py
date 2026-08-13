@@ -245,8 +245,31 @@ def gen_rotary_embedding_inputs(size: dict, dtype: torch.dtype, device: str, see
     batch, heads, seq_len, head_dim = size["batch"], size["heads"], size["seq_len"], size["head_dim"]
     x = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     half_dim = head_dim // 2
-    cos = torch.randn(seq_len, half_dim, device=device, dtype=dtype)
-    sin = torch.randn(seq_len, half_dim, device=device, dtype=dtype)
+    # cos/sin are cosines and sines: bounded in [-1, 1]. Drawing them from
+    # randn instead put |cos| as high as 5, which inflates the output to ~10
+    # and makes fp16 rounding alone exceed the tolerance -- the starter kernel
+    # could not pass its own correctness gate.
+    angles = torch.rand(seq_len, half_dim, device=device) * (2 * math.pi)
+    cos = torch.cos(angles).to(dtype)
+    sin = torch.sin(angles).to(dtype)
+    return {"x": x, "cos": cos, "sin": sin}
+
+
+def gen_rotary_embedding_half_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    batch, heads, seq_len, head_dim = size["batch"], size["heads"], size["seq_len"], size["head_dim"]
+    x = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    # HF builds cos/sin as cat([freqs, freqs], dim=-1), so they span the full
+    # head_dim with each angle duplicated across the halves. Generate them the
+    # same way -- a kernel is allowed to exploit that duplication -- and as
+    # genuine cosines/sines, so they stay bounded in [-1, 1] as they are in a
+    # real model.
+    half_dim = head_dim // 2
+    angles = torch.rand(seq_len, half_dim, device=device) * (2 * math.pi)
+    cos_half = torch.cos(angles).to(dtype)
+    sin_half = torch.sin(angles).to(dtype)
+    cos = torch.cat((cos_half, cos_half), dim=-1)
+    sin = torch.cat((sin_half, sin_half), dim=-1)
     return {"x": x, "cos": cos, "sin": sin}
 
 
@@ -293,6 +316,12 @@ def _ref_fused_mlp(inputs: dict) -> torch.Tensor:
 def _ref_cross_entropy(inputs: dict) -> torch.Tensor:
     import reference
     return reference.cross_entropy_ref(inputs["logits"], inputs["targets"])
+
+def _ref_rotary_embedding_half(inputs: dict) -> torch.Tensor:
+    """RoPE, rotate_half convention (HF LLaMA / Qwen2 / Mistral / Gemma)."""
+    import reference
+    return reference.rotary_embedding_half_ref(inputs["x"], inputs["cos"], inputs["sin"])
+
 
 def _ref_rotary_embedding(inputs: dict) -> torch.Tensor:
     import reference
@@ -531,9 +560,15 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
             ("llm_13b", {"batch": 1, "heads": 40, "seq_len": 2048, "head_dim": 128}),
         ],
         "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
+        # A RoPE kernel accumulates in fp32 and rounds once; the reference runs
+        # the whole expression in the input dtype and rounds repeatedly. The
+        # gap is the *reference's* quantization error, ~eps * |out|, so the
+        # tolerance has to clear the dtype noise floor or a kernel that is
+        # strictly more accurate than the oracle still fails. fp32, where there
+        # is no such floor, stays tight and is what actually pins the maths.
         "tolerances": {
-            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
-            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
+            torch.float16:  {"atol": 5e-3, "rtol": 5e-3},
+            torch.bfloat16: {"atol": 4e-2, "rtol": 2e-2},
             torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
         },
         # mul + add per element, x2 (cos and sin parts)
@@ -542,6 +577,49 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
                                     s["seq_len"] * s["head_dim"]) * _dtype_bytes(dt),
         "input_generator": gen_rotary_embedding_inputs,
         "reference_fn": _ref_rotary_embedding,
+        "edge_sizes": [
+            ("edge_127",  {"batch": 1, "heads": 8, "seq_len": 127,  "head_dim": 64}),
+            ("edge_1023", {"batch": 1, "heads": 8, "seq_len": 1023, "head_dim": 128}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # ROTARY EMBEDDING -- rotate_half convention
+    # -----------------------------------------------------------------
+    # Same op as above, different pairing. HF LLaMA/Qwen2/Mistral/Gemma rotate
+    # element i against i + head_dim//2 rather than adjacent pairs, and pass
+    # cos/sin spanning the full head_dim. A kernel written against the
+    # interleaved oracle computes a different rotation and cannot be plugged
+    # into those models, so the two are graded as separate kernel types.
+    "rotary_embedding_half": {
+        "test_sizes": [
+            ("tiny",    {"batch": 1, "heads": 4,  "seq_len": 64,   "head_dim": 64}),
+            ("small",   {"batch": 2, "heads": 8,  "seq_len": 256,  "head_dim": 64}),
+            ("medium",  {"batch": 2, "heads": 16, "seq_len": 512,  "head_dim": 64}),
+            ("large",   {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128}),
+            ("xlarge",  {"batch": 2, "heads": 32, "seq_len": 2048, "head_dim": 128}),
+            ("qwen2_7b", {"batch": 1, "heads": 28, "seq_len": 2048, "head_dim": 128}),
+            ("llm_7b",  {"batch": 1, "heads": 32, "seq_len": 2048, "head_dim": 128}),
+        ],
+        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
+        # A RoPE kernel accumulates in fp32 and rounds once; the reference runs
+        # the whole expression in the input dtype and rounds repeatedly. The
+        # gap is the *reference's* quantization error, ~eps * |out|, so the
+        # tolerance has to clear the dtype noise floor or a kernel that is
+        # strictly more accurate than the oracle still fails. fp32, where there
+        # is no such floor, stays tight and is what actually pins the maths.
+        "tolerances": {
+            torch.float16:  {"atol": 5e-3, "rtol": 5e-3},
+            torch.bfloat16: {"atol": 4e-2, "rtol": 2e-2},
+            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
+        },
+        # mul + add per element, x2 (cos and sin parts)
+        "flops_fn": lambda s: 6 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"],
+        # cos/sin span the full head_dim here, not half of it.
+        "bytes_fn": lambda s, dt: (s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * 2 +
+                                    s["seq_len"] * s["head_dim"] * 2) * _dtype_bytes(dt),
+        "input_generator": gen_rotary_embedding_half_inputs,
+        "reference_fn": _ref_rotary_embedding_half,
         "edge_sizes": [
             ("edge_127",  {"batch": 1, "heads": 8, "seq_len": 127,  "head_dim": 64}),
             ("edge_1023", {"batch": 1, "heads": 8, "seq_len": 1023, "head_dim": 128}),
